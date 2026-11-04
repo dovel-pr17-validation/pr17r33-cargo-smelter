@@ -1,0 +1,35 @@
+use crate::{AudioChannels, codecs::AudioEncoderOptionsExt};
+
+pub use opus::Error as LibOpusDecoderError;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpusDecoderOptions {
+    /// Opus ID header (RFC 7845 §5.1), e.g. from an E-RTMP sequence header.
+    pub opus_head: Option<bytes::Bytes>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct OpusEncoderOptions {
+    pub channels: AudioChannels,
+    pub preset: OpusEncoderPreset,
+    pub sample_rate: u32,
+    pub forward_error_correction: bool,
+    pub packet_loss: i32,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum OpusEncoderPreset {
+    Quality,
+    Voip,
+    LowestLatency,
+}
+
+impl AudioEncoderOptionsExt for OpusEncoderOptions {
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn channels(&self) -> AudioChannels {
+        self.channels
+    }
+}

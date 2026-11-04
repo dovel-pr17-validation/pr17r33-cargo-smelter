@@ -1,0 +1,129 @@
+use interleaved_uyvy_to_rgba::InterleavedUyvy422ToRgbaConverter;
+use interleaved_yuyv_to_rgba::InterleavedYuyv422ToRgbaConverter;
+use nv12_to_rgba::Nv12ToRgbaConverter;
+
+use crate::wgpu::format::{
+    argb_to_rgba::ArgbToRgbaConverter, bgra_to_rgba::BgraToRgbaConverter,
+    rgba_rescale::RgbaRescaler, rgba_to_nv12::RgbaToNv12Converter,
+};
+
+use self::{planar_yuv_to_rgba::PlanarYuvToRgbaConverter, rgba_to_yuv::RgbaToYuvConverter};
+
+use super::{
+    WgpuCtx,
+    texture::{NV12Texture, PlanarYuvTextures},
+};
+
+mod argb_to_rgba;
+mod bgra_to_rgba;
+mod interleaved_uyvy_to_rgba;
+mod interleaved_yuyv_to_rgba;
+mod nv12_to_rgba;
+mod planar_yuv_to_rgba;
+pub mod rgba_rescale;
+mod rgba_to_nv12;
+mod rgba_to_yuv;
+
+#[derive(Debug)]
+pub struct TextureFormat {
+    pub planar_yuv_to_rgba_linear: PlanarYuvToRgbaConverter,
+    pub interleaved_uyvy_to_rgba_linear: InterleavedUyvy422ToRgbaConverter,
+    pub interleaved_yuyv_to_rgba_linear: InterleavedYuyv422ToRgbaConverter,
+    pub nv12_to_rgba_linear: Nv12ToRgbaConverter,
+    pub bgra_to_rgba_linear: BgraToRgbaConverter,
+    pub argb_to_rgba_linear: ArgbToRgbaConverter,
+
+    pub rgba_to_yuv: RgbaToYuvConverter,
+    pub rgba_to_nv12: RgbaToNv12Converter,
+    pub rgba_rescale_linear: RgbaRescaler,
+    pub rgba_rescale_srgb: RgbaRescaler,
+
+    pub single_texture_layout: wgpu::BindGroupLayout,
+    pub planar_yuv_layout: wgpu::BindGroupLayout,
+    pub nv12_layout: wgpu::BindGroupLayout,
+}
+
+impl TextureFormat {
+    pub fn new(device: &wgpu::Device) -> Self {
+        let single_texture_layout = create_single_texture_bgl(device);
+        let planar_yuv_layout = PlanarYuvTextures::new_bind_group_layout(device);
+        let nv12_layout = NV12Texture::new_bind_group_layout(device);
+
+        let planar_yuv_to_rgba_linear = PlanarYuvToRgbaConverter::new(
+            device,
+            &planar_yuv_layout,
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
+        let interleaved_uyvy_to_rgba_linear = InterleavedUyvy422ToRgbaConverter::new(
+            device,
+            &single_texture_layout,
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
+        let interleaved_yuyv_to_rgba_linear = InterleavedYuyv422ToRgbaConverter::new(
+            device,
+            &single_texture_layout,
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
+
+        let nv12_to_rgba_linear =
+            Nv12ToRgbaConverter::new(device, &nv12_layout, wgpu::TextureFormat::Rgba8Unorm);
+
+        let bgra_to_rgba_linear = BgraToRgbaConverter::new(
+            device,
+            &single_texture_layout,
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
+        let argb_to_rgba_linear = ArgbToRgbaConverter::new(
+            device,
+            &single_texture_layout,
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
+
+        let rgba_to_yuv = RgbaToYuvConverter::new(device, &single_texture_layout);
+        let rgba_to_nv12 = RgbaToNv12Converter::new(device, &single_texture_layout);
+        let rgba_rescale_linear = RgbaRescaler::new(
+            device,
+            &single_texture_layout,
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
+        let rgba_rescale_srgb = RgbaRescaler::new(
+            device,
+            &single_texture_layout,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        );
+
+        Self {
+            planar_yuv_to_rgba_linear,
+            interleaved_uyvy_to_rgba_linear,
+            interleaved_yuyv_to_rgba_linear,
+            nv12_to_rgba_linear,
+            bgra_to_rgba_linear,
+            argb_to_rgba_linear,
+
+            rgba_to_yuv,
+            rgba_to_nv12,
+            rgba_rescale_linear,
+            rgba_rescale_srgb,
+
+            single_texture_layout,
+            planar_yuv_layout,
+            nv12_layout,
+        }
+    }
+}
+
+fn create_single_texture_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            count: None,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                multisampled: false,
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+            },
+        }],
+    })
+}

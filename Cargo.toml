@@ -1,0 +1,147 @@
+[package]
+name = "smelter"
+version = "0.6.0"
+edition = "2024"
+license-file = "./LICENSE"
+
+[workspace]
+members = [
+    # Core crates
+    "smelter-api",
+    "smelter-core",
+    "smelter-render",
+    "smelter-render-wasm",
+
+    # Libraries
+    "decklink",
+    "gpu-video",
+    "libcef",
+    "rtmp",
+
+    # Tools/utils/tests
+    "integration-tests",
+    "integration-tests/macros",
+    "tools",
+]
+resolver = "2"
+
+[features]
+default = ["web-renderer"]
+update-snapshots = []
+decklink = ["smelter-api/decklink"]
+web-renderer = ["dep:libcef", "smelter-api/web-renderer"]
+
+[workspace.dependencies]
+smelter = { path = ".", default-features = false }
+smelter-api = { path = "smelter-api" }
+smelter-core = { path = "smelter-core" }
+smelter-render = { path = "smelter-render" }
+libcef = { path = "libcef" }
+gpu-video = { path = "gpu-video", features = ["expose-parsers", "expose-backends"] }
+rtmp = { path = "rtmp" }
+bytes = "1.11.1"
+serde_json = { version = "1.0.99", features = ["preserve_order"] }
+serde = { version = "1.0.164", features = ["derive", "rc"] }
+thiserror = "1.0.40"
+crossbeam-channel = "0.5.15"
+reqwest = { version = "0.12.3", features = ["blocking", "json"] }
+signal-hook = "0.3.15"
+ffmpeg-next = "9.0.0"
+fs_extra = "1.3.0"
+anyhow = "1.0.71"
+image = { version = "0.24.7", features = ["jpeg", "png"] }
+itertools = "0.14.0"
+rand = "0.9.3"
+tracing = "0.1.40"
+socket2 = "0.5.5"
+webrtc = "0.17.1"
+webrtc-util = "0.17.0"
+opus = "0.3.0"
+rubato = "1.0.0"
+glyphon = { git = "https://github.com/smelter-labs/glyphon", rev = "c784922" }
+futures-util = "0.3.30"
+tokio = { version = "1", features = ["full"] }
+schemars = { version = "0.8.22", features = ["preserve_order"] }
+utoipa = { version = "5.4.0", features = [
+    "rc_schema",
+    "preserve_order",
+    "preserve_path_order",
+    "axum_extras",
+] }
+shared_memory = "0.12.4"
+h264-reader = "0.8.0"
+naga = "30.0.0"
+wgpu = { version = "30.0.0", default-features = false, features = [
+    "wgsl",
+    "dx12",
+    "metal",
+    "naga-ir",
+    "webgl",
+    "fragile-send-sync-non-atomic-wasm",
+    "serde",
+] }
+tower-http = { version = "0.6.1", features = ["cors"] }
+tracing-subscriber = { version = "0.3.20", features = ["json", "env-filter"] }
+pollster = "0.3.0"
+regex = "1.11.2"
+ash = "0.38.0"
+moq-native = "0.15"
+
+[dependencies]
+smelter-api = { workspace = true }
+smelter-render = { workspace = true }
+smelter-core = { workspace = true }
+rtmp = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+tiny_http = "0.12.0"
+ffmpeg-next = { workspace = true }
+crossbeam-channel = { workspace = true }
+signal-hook = { workspace = true }
+fs_extra = { workspace = true }
+schemars = { workspace = true }
+utoipa = { workspace = true }
+image = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+libc = "0.2.151"
+webrtc-util = { workspace = true }
+rand = { workspace = true }
+dirs = "5.0"
+reqwest = { workspace = true }
+rubato = { workspace = true }
+tokio = { workspace = true }
+axum = { version = "0.7.4", features = ["ws", "multipart"] }
+futures-util = { workspace = true }
+wgpu = { workspace = true }
+glyphon = { workspace = true }
+http-body-util = "0.1.2"
+tower-http = { workspace = true }
+regex = { workspace = true }
+moq-native = { workspace = true }
+rustls = "0.23.37"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+shared_memory = { workspace = true }
+libcef = { workspace = true, optional = true }
+
+# Platforms that support vulkan are: windows and all non-apple unixes. emscripten is a web-based platform, where vulkan is not available either
+[target.'cfg(any(windows, all(unix, not(target_os = "emscripten"), not(target_os = "ios"), not(target_os = "macos"))))'.dependencies]
+smelter-api = { workspace = true, features = ["gpu-video"] }
+
+[[bin]]
+name = "process_helper"
+path = "src/bin/process_helper.rs"
+required-features = ["web-renderer"]
+
+[workspace.lints.clippy]
+todo = "warn"
+uninlined_format_args = "warn"
+enum_variant_names = "allow"
+
+[lints]
+workspace = true
+

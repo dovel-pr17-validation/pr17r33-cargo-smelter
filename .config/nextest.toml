@@ -1,0 +1,23 @@
+[profile.default]
+retries = 0
+
+[profile.ci]
+retries = 1
+global-timeout = "30m"
+slow-timeout = { period = "60s", terminate-after = 2 }
+fail-fast = false
+
+[[profile.ci.overrides]]
+filter = 'package(/^integration-tests/) and test(/_flaky$/)'
+threads-required = 100
+retries = 4
+
+[[profile.ci.overrides]]
+filter = 'package(/^integration-tests/) and test(/^pipeline_tests::/)'
+retries = 2
+
+[profile.audit]
+retries = 0
+slow-timeout = "60s"
+threads-required = 8
+fail-fast = false

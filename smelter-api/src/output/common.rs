@@ -1,0 +1,66 @@
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+
+use crate::*;
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, JsonSchema, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PixelFormat {
+    Yuv420p,
+    Yuv422p,
+    Yuv444p,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, JsonSchema, ToSchema)]
+#[serde(untagged)]
+pub enum VideoEncoderBitrate {
+    /// Average bitrate measured in bits/second. Encoder will try to keep the bitrate around the
+    /// provided average, but may temporarily increase it by 25%.
+    AverageBitrate(u64),
+    Vbr {
+        /// Average bitrate measured in bits/second. Encoder will try to keep the bitrate around the
+        /// provided average, but may temporarily increase it to the provided max bitrate.
+        average_bitrate: u64,
+        /// Max bitrate measured in bits/second.
+        max_bitrate: u64,
+    },
+}
+
+/// This type defines when end of an input stream should trigger end of the output stream. Only one
+/// of those fields can be set at the time. Unless specified otherwise the input stream is
+/// considered finished/ended when:
+/// - TCP connection was dropped/closed.
+/// - RTCP Goodbye packet (`BYE`) was received.
+/// - Mp4 track has ended.
+/// - Input was unregistered already (or never registered).
+#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema, ToSchema, Default)]
+#[serde(deny_unknown_fields)]
+pub struct OutputEndCondition {
+    /// Terminate output stream if any of the input streams from the list are finished.
+    pub any_of: Option<Vec<InputId>>,
+    /// Terminate output stream if all the input streams from the list are finished.
+    pub all_of: Option<Vec<InputId>>,
+    /// Terminate output stream if any of the input streams ends. This includes streams added after
+    /// the output was registered. In particular, output stream will **not be** terminated if no
+    /// inputs were ever connected.
+    pub any_input: Option<bool>,
+    /// Terminate output stream if all the input streams finish. In particular, output stream will
+    /// **be** terminated if no inputs were ever connected.
+    pub all_inputs: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, JsonSchema, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OpusEncoderPreset {
+    /// Best for broadcast/high-fidelity application where the decoded audio
+    /// should be as close as possible to the input.
+    Quality,
+    /// Best for most VoIP/videoconference applications where listening quality
+    /// and intelligibility matter most.
+    Voip,
+    /// Only use when lowest-achievable latency is what matters most.
+    LowestLatency,
+}
+
+pub const NO_VULKAN_VIDEO: &str = "Requested `vulkan_h264` encoder, but this binary was compiled without the `gpu-video` feature.";

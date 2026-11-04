@@ -1,0 +1,99 @@
+use std::{marker::PhantomData, sync::Arc, time::Duration};
+
+use tracing::warn;
+
+use crate::{
+    pipeline::{
+        decoder::{AudioDecoder, AudioDecoderStream},
+        rtp::{
+            RtpInputEvent,
+            depayloader::{DepayloaderOptions, DepayloaderStream},
+        },
+    },
+    queue::QueueSender,
+    utils::{
+        InitializableThread, ThreadMetadata,
+        channel::{Sender, duration_bounded},
+    },
+};
+
+use crate::prelude::*;
+
+const RTP_BUFFER: Duration = Duration::from_secs(1);
+
+pub(crate) struct RtpAudioTrackThreadHandle {
+    pub rtp_packet_sender: Sender<PipelineEvent<RtpInputEvent>>,
+    pub sample_rate: u32,
+}
+
+pub(super) struct RtpAudioThreadOptions<Decoder: AudioDecoder> {
+    pub ctx: Arc<PipelineCtx>,
+    pub input_ref: Ref<InputId>,
+    pub decoder_options: Decoder::Options,
+    pub depayloader_options: DepayloaderOptions,
+    pub samples_sender: QueueSender<InputAudioSamples>,
+    pub sample_rate: u32,
+}
+
+pub(super) struct RtpAudioThread<Decoder: AudioDecoder + 'static> {
+    stream: Box<dyn Iterator<Item = InputAudioSamples>>,
+    samples_sender: QueueSender<InputAudioSamples>,
+    _decoder: PhantomData<Decoder>,
+}
+
+impl<Decoder: AudioDecoder + 'static> InitializableThread for RtpAudioThread<Decoder> {
+    type InitOptions = RtpAudioThreadOptions<Decoder>;
+
+    type SpawnOutput = RtpAudioTrackThreadHandle;
+    type SpawnError = DecoderInitError;
+
+    fn init(options: Self::InitOptions) -> Result<(Self, Self::SpawnOutput), Self::SpawnError> {
+        let RtpAudioThreadOptions {
+            ctx,
+            input_ref,
+            decoder_options,
+            depayloader_options,
+            samples_sender,
+            sample_rate,
+        } = options;
+
+        let (rtp_packet_sender, rtp_packet_receiver) = duration_bounded(RTP_BUFFER);
+
+        let depayloader_stream =
+            DepayloaderStream::new(depayloader_options, rtp_packet_receiver.into_iter());
+
+        let decoder_stream = AudioDecoderStream::<Decoder, _>::new(
+            ctx,
+            input_ref,
+            decoder_options,
+            depayloader_stream.flatten(),
+        )?;
+
+        let state = Self {
+            stream: Box::new(decoder_stream.flatten()),
+            samples_sender,
+            _decoder: PhantomData,
+        };
+        let output = RtpAudioTrackThreadHandle {
+            rtp_packet_sender,
+            sample_rate,
+        };
+        Ok((state, output))
+    }
+
+    fn run(self) {
+        for event in self.stream {
+            if self.samples_sender.send(event).is_err() {
+                warn!("Failed to send decoded audio samples from decoder. Channel closed.");
+                return;
+            }
+        }
+    }
+
+    fn metadata() -> ThreadMetadata {
+        ThreadMetadata {
+            thread_name: format!("Rtp Audio Decoder ({})", Decoder::LABEL),
+            thread_instance_name: "Input".to_string(),
+        }
+    }
+}

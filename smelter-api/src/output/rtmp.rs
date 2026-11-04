@@ -1,0 +1,132 @@
+use std::{collections::HashMap, sync::Arc};
+
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+
+use crate::*;
+
+#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RtmpOutput {
+    /// RTMP endpoint url.
+    pub url: Arc<str>,
+    /// Video stream configuration.
+    pub video: Option<OutputRtmpClientVideoOptions>,
+    /// Audio stream configuration.
+    pub audio: Option<OutputRtmpClientAudioOptions>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OutputRtmpClientVideoOptions {
+    /// Output resolution in pixels.
+    pub resolution: Resolution,
+    /// Condition for termination of the output stream based on the input streams states. If output
+    /// includes both audio and video streams, then EOS needs to be sent for every type.
+    pub send_eos_when: Option<OutputEndCondition>,
+    /// Video encoder options.
+    pub encoder: RtmpClientVideoEncoderOptions,
+    /// Root of a component tree/scene that should be rendered for the output. Use the
+    /// `POST /api/output/{output_id}/update` request to update this value after registration.
+    pub initial: VideoScene,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RtmpClientVideoEncoderOptions {
+    #[serde(rename = "ffmpeg_h264")]
+    FfmpegH264 {
+        /// FFmpeg encoder name, e.g. `"libopenh264"`. Must be available in the FFmpeg installed
+        /// on the system.
+        ///
+        /// Defaults to the H264 encoder that FFmpeg selects by default.
+        encoder_name: Option<Arc<str>>,
+
+        /// Encoding bitrate. Default value depends on chosen encoder.
+        bitrate: Option<VideoEncoderBitrate>,
+
+        /// Maximal interval between keyframes, in milliseconds. Defaults to `5000`.
+        keyframe_interval_ms: Option<f64>,
+
+        /// Encoder pixel format. Defaults to `"yuv420p"`.
+        pixel_format: Option<PixelFormat>,
+
+        /// Raw FFmpeg encoder options. See https://ffmpeg.org/ffmpeg-codecs.html for more.
+        ffmpeg_options: Option<HashMap<Arc<str>, Arc<str>>>,
+    },
+    /// Requires Enhanced RTMP support on the receiver side.
+    #[serde(rename = "ffmpeg_vp8")]
+    FfmpegVp8 {
+        /// Encoding bitrate. If not provided, bitrate is calculated based on resolution and
+        /// framerate. For example at 1080p 30 FPS the average bitrate is 5000 kbit/s and max
+        /// bitrate is 6250 kbit/s.
+        bitrate: Option<VideoEncoderBitrate>,
+
+        /// Maximal interval between keyframes, in milliseconds. Defaults to `5000`.
+        keyframe_interval_ms: Option<f64>,
+
+        /// Raw FFmpeg encoder options. See https://ffmpeg.org/ffmpeg-codecs.html for more.
+        ffmpeg_options: Option<HashMap<Arc<str>, Arc<str>>>,
+    },
+    /// Requires Enhanced RTMP support on the receiver side.
+    #[serde(rename = "ffmpeg_vp9")]
+    FfmpegVp9 {
+        /// Encoding bitrate. If not provided, bitrate is calculated based on resolution and
+        /// framerate. For example at 1080p 30 FPS the average bitrate is 5000 kbit/s and max
+        /// bitrate is 6250 kbit/s.
+        bitrate: Option<VideoEncoderBitrate>,
+
+        /// Maximal interval between keyframes, in milliseconds. Defaults to `5000`.
+        keyframe_interval_ms: Option<f64>,
+
+        /// Encoder pixel format. Defaults to `"yuv420p"`.
+        pixel_format: Option<PixelFormat>,
+
+        /// Raw FFmpeg encoder options. See https://ffmpeg.org/ffmpeg-codecs.html for more.
+        ffmpeg_options: Option<HashMap<Arc<str>, Arc<str>>>,
+    },
+    #[serde(rename = "vulkan_h264")]
+    VulkanH264 {
+        /// Encoding bitrate. If not provided, bitrate is calculated based on resolution and
+        /// framerate. For example at 1080p 30 FPS the average bitrate is 5000 kbit/s and max
+        /// bitrate is 6250 kbit/s.
+        bitrate: Option<VideoEncoderBitrate>,
+
+        /// Interval between keyframes, in milliseconds. Defaults to `5000`.
+        keyframe_interval_ms: Option<f64>,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OutputRtmpClientAudioOptions {
+    /// Specifies how audio should be mixed. Defaults to `"sum_clip"`.
+    pub mixing_strategy: Option<AudioMixingStrategy>,
+    /// Condition for termination of the output stream based on the input streams states. If output
+    /// includes both audio and video streams, then EOS needs to be sent for every type.
+    pub send_eos_when: Option<OutputEndCondition>,
+    /// Audio encoder options.
+    pub encoder: RtmpClientAudioEncoderOptions,
+    /// Channels configuration.
+    pub channels: Option<AudioChannels>,
+    /// Initial audio mixer configuration for output.
+    pub initial: AudioScene,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RtmpClientAudioEncoderOptions {
+    Aac {
+        /// Sample rate. Allowed values: [8000, 16000, 24000, 44100, 48000]. Defaults to `44100`.
+        sample_rate: Option<u32>,
+    },
+    /// Requires Enhanced RTMP support on the receiver side.
+    Opus {
+        /// Audio output encoder preset. Defaults to `"voip"`.
+        preset: Option<OpusEncoderPreset>,
+
+        /// Sample rate. Allowed values: [8000, 16000, 24000, 48000]. Defaults to `48000`.
+        sample_rate: Option<u32>,
+    },
+}

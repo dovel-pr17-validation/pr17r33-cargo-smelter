@@ -1,0 +1,329 @@
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
+
+use crossbeam_channel::bounded;
+use tracing::{debug, warn};
+
+use crate::{
+    RtmpEvent, RtmpServerConnectionError, RtmpStreamError,
+    amf0::AmfValue,
+    message::{
+        AudioMessage, CONTROL_MESSAGE_STREAM_ID, CommandMessage, CommandMessageOk, DataMessage,
+        RtmpMessageIncoming, RtmpMessageOutgoing, UserControlMessage, VideoMessage,
+    },
+    protocol::{
+        byte_stream::RtmpByteStream, handshake::Handshake, message_stream::RtmpMessageStream,
+    },
+    server::{
+        instance::ServerConnectionCtx,
+        negotiation::{NegotiationProgress, NegotiationResult, PEER_BANDWIDTH, WINDOW_ACK_SIZE},
+    },
+    transport::RtmpTransport,
+};
+
+use crate::{
+    CAPS_EX_MODEX, CAPS_EX_RECONNECT, CAPS_EX_TIMESTAMP_NANO, FOURCC_INFO_CAN_DECODE,
+    FOURCC_INFO_CAN_FORWARD, RtmpAudioCodec, RtmpVideoCodec,
+};
+
+/// For server we can pick this number for client it would be based on value
+/// that came as _result for createStream
+const PUBLISHED_MESSAGE_STREAM_ID: u32 = 1;
+
+pub(super) fn run_connection_thread(
+    ctx: &Arc<Mutex<ServerConnectionCtx>>,
+    transport: RtmpTransport,
+) -> Result<(), RtmpServerConnectionError> {
+    let (shutdown_condition, video_codecs, audio_codecs) = {
+        let guard = ctx.lock().unwrap();
+        (
+            guard.shutdown_condition.clone(),
+            guard.video_codecs.clone(),
+            guard.audio_codecs.clone(),
+        )
+    };
+    let mut stream = RtmpByteStream::new(transport, shutdown_condition);
+
+    Handshake::perform_as_server(&mut stream)?;
+    debug!("Handshake complete");
+
+    let mut state = RtmpServerConnectionState {
+        stream: RtmpMessageStream::new(stream),
+        window_size: None,
+        last_ack: 0,
+        video_codecs,
+        audio_codecs,
+    };
+
+    let NegotiationResult { app, stream_key } = state.negotiate_connection()?;
+    debug!(?app, ?stream_key, "Negotiation complete");
+
+    let (sender, receiver) = bounded(1000);
+    // Return connection to caller via on_connection callback
+    ctx.lock()
+        .unwrap()
+        .send_connection(app, stream_key, receiver)?;
+
+    loop {
+        let msg = state.next_msg()?;
+
+        let event = match msg {
+            RtmpMessageIncoming::Audio { audio, .. } => match audio {
+                AudioMessage::Data(data) => RtmpEvent::AudioData(data),
+                AudioMessage::Config(config) => RtmpEvent::AudioConfig(config),
+                AudioMessage::Unknown => continue,
+            },
+            RtmpMessageIncoming::Video { video, .. } => match video {
+                VideoMessage::Data(data) => RtmpEvent::VideoData(data),
+                VideoMessage::Config(config) => RtmpEvent::VideoConfig(config),
+                VideoMessage::Unknown => continue,
+            },
+            RtmpMessageIncoming::DataMessage {
+                data: DataMessage::OnMetaData(metadata),
+                ..
+            } => RtmpEvent::Metadata(metadata),
+            RtmpMessageIncoming::CommandMessage {
+                msg: CommandMessage::DeleteStream { .. },
+                ..
+            } => {
+                return Ok(());
+            }
+            msg => {
+                state.default_msg_handler(msg)?;
+                continue;
+            }
+        };
+
+        if sender.send(event).is_err() {
+            debug!("Channel closed. Stopping connection.");
+            return Ok(());
+        }
+    }
+}
+
+struct RtmpServerConnectionState {
+    stream: RtmpMessageStream,
+
+    /// window size for data incoming from the client
+    window_size: Option<u64>,
+    /// last ack sent to client
+    last_ack: u64,
+
+    /// Codecs to advertise in the `connect` response.
+    video_codecs: Vec<RtmpVideoCodec>,
+    audio_codecs: Vec<RtmpAudioCodec>,
+}
+
+impl RtmpServerConnectionState {
+    fn next_msg(&mut self) -> Result<RtmpMessageIncoming, RtmpServerConnectionError> {
+        loop {
+            match self.stream.read_msg() {
+                // should catch unknown messages or parsing error that
+                // do not break stream continuity
+                Err(err) if !err.is_critical() => {
+                    warn!(?err);
+                    continue;
+                }
+                Ok(msg) => return Ok(msg),
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+
+    fn negotiate_connection(&mut self) -> Result<NegotiationResult, RtmpServerConnectionError> {
+        let mut state = NegotiationProgress::WaitingForConnect;
+
+        loop {
+            let msg = self.next_msg()?;
+
+            if let Some((transaction_id, app)) = state.try_match_connect(&msg) {
+                state = NegotiationProgress::WaitingForCreateStream { app };
+                self.on_connect(transaction_id)?;
+                continue;
+            }
+
+            if let Some((transaction_id, app)) = state.try_match_create_stream(&msg) {
+                state = NegotiationProgress::WaitingForPublish { app };
+
+                self.stream.write_msg(RtmpMessageOutgoing::CommandMessage {
+                    msg: CommandMessageOk {
+                        transaction_id,
+                        command_object: AmfValue::Null,
+                        response: AmfValue::Number(PUBLISHED_MESSAGE_STREAM_ID as f64),
+                    }
+                    .into(),
+                    stream_id: CONTROL_MESSAGE_STREAM_ID,
+                })?;
+
+                self.stream.write_msg(
+                    UserControlMessage::StreamBegin {
+                        stream_id: PUBLISHED_MESSAGE_STREAM_ID,
+                    }
+                    .into(),
+                )?;
+                continue;
+            }
+
+            if let Some(result) = state.try_match_publish(&msg) {
+                let status_info = HashMap::from_iter(
+                    [
+                        ("level", "status".into()),
+                        ("code", "NetStream.Publish.Start".into()),
+                        ("description", "Publishing stream".into()),
+                    ]
+                    .into_iter()
+                    .map(|(k, v)| (k.into(), v)),
+                );
+
+                self.stream.write_msg(RtmpMessageOutgoing::CommandMessage {
+                    msg: CommandMessage::OnStatus(AmfValue::Object(status_info)),
+                    stream_id: PUBLISHED_MESSAGE_STREAM_ID,
+                })?;
+                return Ok(result);
+            }
+
+            self.default_msg_handler(msg)?
+        }
+    }
+
+    fn on_connect(&mut self, transaction_id: u32) -> Result<(), RtmpServerConnectionError> {
+        self.stream.write_msg(RtmpMessageOutgoing::WindowAckSize {
+            window_size: WINDOW_ACK_SIZE,
+        })?;
+        self.stream
+            .write_msg(RtmpMessageOutgoing::SetPeerBandwidth {
+                bandwidth: PEER_BANDWIDTH,
+                limit_type: 0, // 0 - Hard, 1 - Soft, 2 - Dynamic
+            })?;
+
+        self.stream
+            .write_msg(UserControlMessage::StreamBegin { stream_id: 0 }.into())?;
+
+        let decode_forward_caps =
+            AmfValue::Number((FOURCC_INFO_CAN_DECODE | FOURCC_INFO_CAN_FORWARD) as f64);
+
+        let mut video_fourcc_info_map = HashMap::new();
+        video_fourcc_info_map.insert(
+            "*".to_string(),
+            AmfValue::Number(FOURCC_INFO_CAN_FORWARD as f64),
+        );
+        for codec in &self.video_codecs {
+            video_fourcc_info_map.insert(codec.fourcc().to_string(), decode_forward_caps.clone());
+        }
+
+        let mut audio_fourcc_info_map = HashMap::new();
+        audio_fourcc_info_map.insert(
+            "*".to_string(),
+            AmfValue::Number(FOURCC_INFO_CAN_FORWARD as f64),
+        );
+        for codec in &self.audio_codecs {
+            audio_fourcc_info_map.insert(codec.fourcc().to_string(), decode_forward_caps.clone());
+        }
+
+        let fourcc_list: Vec<AmfValue> = self
+            .video_codecs
+            .iter()
+            .map(|c| AmfValue::String(c.fourcc().to_string()))
+            .chain(
+                self.audio_codecs
+                    .iter()
+                    .map(|c| AmfValue::String(c.fourcc().to_string())),
+            )
+            .collect();
+        // _result - connect response
+        let props = HashMap::from_iter(
+            [
+                ("fmsVer", "FMS/3,0,1,123".into()),
+                ("capabilities", AmfValue::Number(31.0)),
+                ("fourCcList", AmfValue::StrictArray(fourcc_list)),
+                (
+                    "videoFourCcInfoMap",
+                    AmfValue::Object(video_fourcc_info_map),
+                ),
+                (
+                    "audioFourCcInfoMap",
+                    AmfValue::Object(audio_fourcc_info_map),
+                ),
+                (
+                    "capsEx",
+                    AmfValue::Number(
+                        (CAPS_EX_RECONNECT | CAPS_EX_MODEX | CAPS_EX_TIMESTAMP_NANO) as f64,
+                    ),
+                ),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.into(), v)),
+        );
+        let info = HashMap::from_iter(
+            [
+                ("level", "status".into()),
+                ("code", "NetConnection.Connect.Success".into()),
+                ("description", "Connection succeeded".into()),
+                ("objectEncoding", AmfValue::Number(0 as f64)), // AMF0 encoding
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.into(), v)),
+        );
+        self.stream.write_msg(RtmpMessageOutgoing::CommandMessage {
+            msg: CommandMessageOk {
+                transaction_id,
+                command_object: AmfValue::Object(props),
+                response: AmfValue::Object(info),
+            }
+            .into(),
+            stream_id: CONTROL_MESSAGE_STREAM_ID,
+        })?;
+        Ok(())
+    }
+
+    /// Message handler for messages not related to life cycle
+    fn default_msg_handler(&mut self, msg: RtmpMessageIncoming) -> Result<(), RtmpStreamError> {
+        match msg {
+            RtmpMessageIncoming::SetChunkSize { chunk_size } => {
+                self.stream.set_reader_chunk_size(chunk_size as usize);
+            }
+            RtmpMessageIncoming::WindowAckSize { window_size } => {
+                self.window_size = Some(window_size as u64);
+            }
+            RtmpMessageIncoming::Acknowledgement { .. } => {
+                // Server does not send much data, so receiving ACK will
+                // be very rare
+            }
+            RtmpMessageIncoming::SetPeerBandwidth { bandwidth, .. } => {
+                // It configures how often client will be sending ACKs,
+                // it is different that self.window_size
+                self.stream.write_msg(RtmpMessageOutgoing::WindowAckSize {
+                    window_size: bandwidth,
+                })?;
+            }
+            RtmpMessageIncoming::UserControl(UserControlMessage::PingRequest { timestamp }) => {
+                let msg = UserControlMessage::PingResponse { timestamp };
+                self.stream.write_msg(msg.into())?;
+            }
+            _ => {
+                debug!(?msg, "Unhandled message")
+            }
+        }
+
+        self.maybe_send_ack()?;
+
+        Ok(())
+    }
+
+    fn maybe_send_ack(&mut self) -> Result<(), RtmpStreamError> {
+        let Some(window_size) = self.window_size else {
+            return Ok(());
+        };
+        let bytes_received = self.stream.bytes_read();
+        if bytes_received.saturating_sub(self.last_ack) > window_size / 2 {
+            self.stream
+                .write_msg(RtmpMessageOutgoing::Acknowledgement {
+                    bytes_received: (bytes_received % (u32::MAX as u64 + 1)) as u32,
+                })?;
+            self.last_ack = bytes_received;
+        }
+        Ok(())
+    }
+}

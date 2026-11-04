@@ -1,0 +1,25 @@
+[project]
+name = "example"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "smelter-sdk",
+    "faster-whisper",
+    "silero-vad>=5.1",
+    "numpy",
+    "ultralytics>=8.4.40",
+    "opencv-python-headless>=4.13.0.92",
+    "lap>=0.5.12",
+]
+
+[project.scripts]
+example-yolo-whisper = "example.yolo_whisper:main"
+example-simple-sync = "example.simple_sync:main"
+example-simple-async = "example.simple_async:main"
+
+[tool.uv.sources]
+smelter-sdk = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

@@ -1,0 +1,40 @@
+[package]
+name = "tools" 
+version = "0.1.0"
+edition = "2024"
+license-file = "../LICENSE"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+smelter = { workspace = true }
+smelter-api = { workspace = true }
+smelter-core = { workspace = true }
+smelter-render = { workspace = true }
+libcef = { workspace = true }
+reqwest = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ffmpeg-next = { workspace = true }
+fs_extra = { workspace = true }
+socket2 = { workspace = true }
+bytes = { workspace = true }
+webrtc-util = { workspace = true }
+crossbeam-channel = { workspace = true }
+tracing = { workspace = true }
+opus = { workspace = true }
+pitch-detection = "0.3.0"
+rand = { workspace = true }
+schemars = { workspace = true}
+utoipa = { workspace = true }
+tracing-subscriber = { version = "0.3.20", features = ["json", "env-filter"] }
+tokio = { workspace = true }
+regex = { workspace = true }
+tar = "0.4.46"
+flate2 = "1.1.4"
+inquire = "0.7.5"
+crossterm = "0.25.0"
+
+[lints]
+workspace = true

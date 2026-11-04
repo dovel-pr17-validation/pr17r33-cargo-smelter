@@ -1,0 +1,144 @@
+use crate::graphics_context::wgpu_context::{BoxableHasDisplayHandle, create_wgpu_graphics_ctx};
+
+#[cfg(feature = "gpu-video")]
+pub mod vulkan_context;
+pub mod wgpu_context;
+
+#[cfg(feature = "gpu-video")]
+#[derive(Debug, Clone)]
+pub struct VulkanCtx {
+    pub adapter_info: std::sync::Arc<gpu_video::capabilities::VideoAdapterInfo>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GraphicsContext {
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    pub adapter: wgpu::Adapter,
+    pub instance: wgpu::Instance,
+
+    #[cfg(feature = "gpu-video")]
+    pub vulkan_ctx: Option<VulkanCtx>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct GraphicsContextOptions<'a> {
+    pub device_id: Option<u32>,
+    pub driver_name: Option<String>,
+    pub force_gpu: bool,
+    pub features: wgpu::Features,
+    pub limits: wgpu::Limits,
+    pub compatible_surface: Option<&'a wgpu::Surface<'a>>,
+    pub display_handle: Option<&'a dyn BoxableHasDisplayHandle>,
+    pub libvulkan_path: Option<&'a std::ffi::OsStr>,
+}
+
+impl GraphicsContext {
+    #[cfg(feature = "gpu-video")]
+    pub fn new(opts: GraphicsContextOptions) -> Result<Self, CreateGraphicsContextError> {
+        use crate::graphics_context::vulkan_context::create_vulkan_graphics_ctx;
+        use tracing::warn;
+
+        match create_vulkan_graphics_ctx(opts.clone()) {
+            Err(err) => {
+                warn!(
+                    "Cannot initialize vulkan video context. Reason: {err}. Initializing without vulkan video support."
+                );
+                create_wgpu_graphics_ctx(opts)
+            }
+            ctx => ctx,
+        }
+    }
+
+    #[cfg(not(feature = "gpu-video"))]
+    pub fn new(opts: GraphicsContextOptions) -> Result<Self, CreateGraphicsContextError> {
+        create_wgpu_graphics_ctx(opts)
+    }
+
+    #[cfg(feature = "gpu-video")]
+    pub fn has_vulkan_decoder_support(&self) -> bool {
+        self.vulkan_ctx
+            .as_ref()
+            .map(|ctx| ctx.adapter_info.supports_decoding)
+            .unwrap_or(false)
+    }
+    #[cfg(not(feature = "gpu-video"))]
+    pub fn has_vulkan_decoder_support(&self) -> bool {
+        false
+    }
+
+    #[cfg(feature = "gpu-video")]
+    pub fn has_vulkan_encoder_support(&self) -> bool {
+        self.vulkan_ctx
+            .as_ref()
+            .map(|ctx| ctx.adapter_info.supports_encoding)
+            .unwrap_or(false)
+    }
+    #[cfg(not(feature = "gpu-video"))]
+    pub fn has_vulkan_encoder_support(&self) -> bool {
+        false
+    }
+
+    #[cfg(feature = "gpu-video")]
+    pub fn vulkan_h264_decode_profile_level_support(&self) -> Option<H264ProfileLevelSupport> {
+        let vulkan_ctx = self.vulkan_ctx.as_ref()?;
+        let caps = vulkan_ctx.adapter_info.decode_capabilities.h264?;
+
+        Some(H264ProfileLevelSupport {
+            baseline_max_level_idc: caps.baseline_profile.map(|p| p.max_level_idc),
+            main_max_level_idc: caps.main_profile.map(|p| p.max_level_idc),
+            high_max_level_idc: caps.high_profile.map(|p| p.max_level_idc),
+        })
+    }
+
+    #[cfg(not(feature = "gpu-video"))]
+    pub fn vulkan_h264_decode_profile_level_support(&self) -> Option<H264ProfileLevelSupport> {
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct H264ProfileLevelSupport {
+    pub baseline_max_level_idc: Option<u8>,
+    pub main_max_level_idc: Option<u8>,
+    pub high_max_level_idc: Option<u8>,
+}
+
+impl H264ProfileLevelSupport {
+    pub fn max_level_for_profile(self, profile_idc: u8) -> Option<u8> {
+        match profile_idc {
+            0x42 => self.baseline_max_level_idc,
+            0x4d => self.main_max_level_idc,
+            0x64 => self.high_max_level_idc,
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CreateGraphicsContextError {
+    #[error("Failed to get an adapter.")]
+    NoAdapter,
+
+    #[error("Error when requesting a wgpu adapter.")]
+    RequestWgpuAdapterError(#[from] wgpu::RequestAdapterError),
+
+    #[error("Failed to get a wgpu device.")]
+    NoWgpuDevice(#[from] wgpu::RequestDeviceError),
+
+    #[cfg(feature = "gpu-video")]
+    #[error(transparent)]
+    VideoInstanceInitError(#[from] gpu_video::backends::vulkan::VulkanInstanceInitError),
+
+    #[cfg(feature = "gpu-video")]
+    #[error(transparent)]
+    VideoDeviceInitError(#[from] gpu_video::VideoDeviceInitError),
+
+    #[cfg(feature = "gpu-video")]
+    #[error(transparent)]
+    VulkanLoadingError(#[from] ash::LoadingError),
+
+    #[cfg(feature = "gpu-video")]
+    #[error(transparent)]
+    WgpuHalInstanceError(#[from] wgpu::hal::InstanceError),
+}

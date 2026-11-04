@@ -1,0 +1,62 @@
+{
+  "name": "@swmansion/smelter-web-wasm",
+  "version": "0.4.0",
+  "author": "Software Mansion <contact@swmansion.com>",
+  "license": "SEE LICENSE IN ./LICENSE",
+  "description": "Smelter server running directlly in browser",
+  "bugs": {
+    "url": "https://github.com/software-mansion/smelter/issues"
+  },
+  "homepage": "https://smelter.dev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/software-mansion/smelter.git",
+    "directory": "ts/smelter-web-wasm"
+  },
+  "files": [
+    "/dist",
+    "/LICENSE"
+  ],
+  "type": "commonjs",
+  "main": "./dist/cjs/index.cjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/esm/index.mjs"
+      },
+      "default": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/cjs/index.cjs"
+      }
+    }
+  },
+  "scripts": {
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "watch": "rollup -w --no-watch.clearScreen -c",
+    "build": "rollup -c",
+    "clean": "rimraf dist",
+    "prepublishOnly": "pnpm run clean && pnpm run build"
+  },
+  "dependencies": {
+    "@datastructures-js/queue": "^4.2.3",
+    "@swmansion/smelter-browser-render": "workspace:0.4.0",
+    "@swmansion/smelter-core": "workspace:0.4.0",
+    "mp4box": "^0.5.2",
+    "path-parser": "^6.1.0",
+    "pino": "^9.5.0"
+  },
+  "devDependencies": {
+    "@rollup/plugin-commonjs": "^28.0.2",
+    "@rollup/plugin-node-resolve": "^16.0.0",
+    "@rollup/plugin-typescript": "^11.1.6",
+    "@types/react": "^18.3.3",
+    "rollup": "^4.59.0",
+    "rollup-plugin-dts": "^6.1.1"
+  },
+  "peerDependencies": {
+    "@swmansion/smelter": "workspace:^0.4.0"
+  }
+}

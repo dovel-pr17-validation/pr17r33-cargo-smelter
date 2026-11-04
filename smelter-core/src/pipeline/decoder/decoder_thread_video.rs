@@ -1,0 +1,98 @@
+use std::{marker::PhantomData, sync::Arc, time::Duration};
+
+use tracing::warn;
+
+use smelter_render::InputId;
+
+use crate::{
+    Frame, PipelineCtx, PipelineEvent, Ref,
+    error::DecoderInitError,
+    pipeline::decoder::{
+        BytestreamTransformStream, BytestreamTransformer, DecoderThreadHandle, EncodedInputEvent,
+        VideoDecoderStream,
+    },
+    queue::QueueSender,
+    utils::{InitializableThread, ThreadMetadata, channel::duration_bounded},
+};
+
+use super::VideoDecoder;
+
+pub(crate) struct VideoDecoderThreadOptions<Transformer: BytestreamTransformer> {
+    pub ctx: Arc<PipelineCtx>,
+    pub input_ref: Ref<InputId>,
+    pub transformer: Option<Transformer>,
+    pub frame_sender: QueueSender<Frame>,
+    pub input_buffer_size: Duration,
+}
+
+pub(crate) struct VideoDecoderThread<Decoder: VideoDecoder, Transformer: BytestreamTransformer> {
+    stream: Box<dyn Iterator<Item = Frame>>,
+    frame_sender: QueueSender<Frame>,
+    _decoder: PhantomData<Decoder>,
+    _transformer: PhantomData<Transformer>,
+}
+
+impl<Decoder, Transformer> InitializableThread for VideoDecoderThread<Decoder, Transformer>
+where
+    Decoder: VideoDecoder + 'static,
+    Transformer: BytestreamTransformer,
+{
+    type InitOptions = VideoDecoderThreadOptions<Transformer>;
+
+    type SpawnOutput = DecoderThreadHandle;
+    type SpawnError = DecoderInitError;
+
+    fn init(options: Self::InitOptions) -> Result<(Self, Self::SpawnOutput), Self::SpawnError> {
+        let VideoDecoderThreadOptions {
+            ctx,
+            input_ref,
+            transformer,
+            frame_sender,
+            input_buffer_size: buffer_size,
+        } = options;
+        let (chunk_sender, chunk_receiver) = duration_bounded(buffer_size);
+
+        let transformed_bytestream =
+            BytestreamTransformStream::new(transformer, chunk_receiver.into_iter());
+
+        // Every source of this thread sends whole access units. Without the delimiter, the H264
+        // parser holds an access unit until the next chunk arrives.
+        let bytestream = transformed_bytestream.flat_map(|event| {
+            let events = match event {
+                PipelineEvent::Data(EncodedInputEvent::Chunk(chunk)) => [
+                    Some(PipelineEvent::Data(EncodedInputEvent::Chunk(chunk))),
+                    Some(PipelineEvent::Data(EncodedInputEvent::AuDelimiter)),
+                ],
+                event => [Some(event), None],
+            };
+            events.into_iter().flatten()
+        });
+
+        let decoder_stream = VideoDecoderStream::<Decoder, _>::new(ctx, input_ref, bytestream)?;
+
+        let state = Self {
+            stream: Box::new(decoder_stream.flatten()),
+            frame_sender,
+            _decoder: PhantomData,
+            _transformer: PhantomData,
+        };
+        let output = DecoderThreadHandle { chunk_sender };
+        Ok((state, output))
+    }
+
+    fn run(self) {
+        for event in self.stream {
+            if self.frame_sender.send(event).is_err() {
+                warn!("Failed to send decoded video frame from decoder. Channel closed.");
+                return;
+            }
+        }
+    }
+
+    fn metadata() -> ThreadMetadata {
+        ThreadMetadata {
+            thread_name: format!("Video Decoder ({})", Decoder::LABEL),
+            thread_instance_name: "Input".to_string(),
+        }
+    }
+}

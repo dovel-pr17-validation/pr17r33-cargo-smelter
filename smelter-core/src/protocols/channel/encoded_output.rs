@@ -1,0 +1,46 @@
+use core::fmt;
+
+use crate::{
+    MediaKind, Timestamp,
+    codecs::{AudioEncoderOptions, VideoEncoderOptions},
+};
+
+/// Options to configure output that sends encoded audio and video chunks via single channel
+#[derive(Debug, Clone)]
+pub struct EncodedDataOutputOptions {
+    pub video: Option<VideoEncoderOptions>,
+    pub audio: Option<AudioEncoderOptions>,
+}
+
+#[derive(Debug, Clone)]
+pub enum EncodedOutputEvent {
+    Data(EncodedOutputChunk),
+    AudioEOS,
+    VideoEOS,
+}
+
+/// A struct representing a chunk of encoded data.
+///
+/// Many codecs specify that encoded data is split into chunks.
+/// For example, H264 splits the data into NAL units and AV1 splits the data into OBU frames.
+#[derive(Clone)]
+pub struct EncodedOutputChunk {
+    pub data: bytes::Bytes,
+    pub pts: Timestamp,
+    pub dts: Option<Timestamp>,
+    pub is_keyframe: bool,
+    pub kind: MediaKind,
+}
+
+impl fmt::Debug for EncodedOutputChunk {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let len = self.data.len();
+        let first_bytes = &self.data[0..usize::min(10, len)];
+        f.debug_struct("EncodedChunk")
+            .field("data", &format!("len={len}, {first_bytes:?}"))
+            .field("pts", &self.pts)
+            .field("dts", &self.dts)
+            .field("kind", &self.kind)
+            .finish()
+    }
+}

@@ -1,0 +1,171 @@
+use std::mem;
+
+use bytes::Bytes;
+use tracing::{info, trace};
+use webrtc::rtp::{
+    self,
+    codecs::{opus::OpusPacket, vp8::Vp8Packet, vp9::Vp9Packet},
+    packetizer::Depacketizer,
+};
+
+use crate::{
+    codecs::{AacAudioSpecificConfig, AudioCodec, VideoCodec},
+    pipeline::rtp::RtpPacket,
+    protocols::{AacDepayloadingError, RtpAacDepayloaderMode},
+};
+use crate::{pipeline::decoder::EncodedInputEvent, prelude::*};
+
+pub(crate) use crate::pipeline::rtp::depayloader::dynamic_stream::{
+    DynamicDepayloaderStream, VideoPayloadTypeMapping,
+};
+pub(crate) use crate::pipeline::rtp::depayloader::static_stream::DepayloaderStream;
+
+pub use aac_depayloader::AacDepayloader;
+use h264_depayloader::H264Depayloader;
+
+mod aac_depayloader;
+mod dynamic_stream;
+mod h264_depayloader;
+mod static_stream;
+
+#[derive(Debug)]
+pub enum DepayloaderOptions {
+    H264,
+    Vp8,
+    Vp9,
+    Opus,
+    Aac(RtpAacDepayloaderMode, AacAudioSpecificConfig),
+}
+
+pub fn new_depayloader(options: DepayloaderOptions) -> Box<dyn Depayloader> {
+    info!(?options, "Initialize RTP depayloader");
+    match options {
+        DepayloaderOptions::H264 => Box::new(H264Depayloader::default()),
+        DepayloaderOptions::Vp8 => {
+            BufferedDepayloader::<Vp8Packet>::new_boxed(MediaKind::Video(VideoCodec::Vp8))
+        }
+        DepayloaderOptions::Vp9 => {
+            BufferedDepayloader::<Vp9Packet>::new_boxed(MediaKind::Video(VideoCodec::Vp9))
+        }
+        DepayloaderOptions::Opus => {
+            SimpleDepayloader::<OpusPacket>::new_boxed(MediaKind::Audio(AudioCodec::Opus))
+        }
+        DepayloaderOptions::Aac(mode, asc) => Box::new(AacDepayloader::new(mode, asc)),
+    }
+}
+
+pub(crate) trait Depayloader {
+    fn depayload(&mut self, packet: RtpPacket)
+    -> Result<Vec<EncodedInputEvent>, DepayloadingError>;
+
+    /// Called when a packet was lost, before the packets that follow it.
+    fn on_lost_packet(&mut self) {}
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DepayloadingError {
+    #[error(transparent)]
+    Rtp(#[from] rtp::Error),
+    #[error("AAC depayloading error")]
+    Aac(#[from] AacDepayloadingError),
+}
+
+struct BufferedDepayloader<T: Depacketizer + Default + 'static> {
+    kind: MediaKind,
+    buffer: Vec<Bytes>,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<T: Depacketizer + Default + 'static> BufferedDepayloader<T> {
+    fn new_boxed(kind: MediaKind) -> Box<dyn Depayloader> {
+        Box::new(Self {
+            kind,
+            buffer: Vec::new(),
+            _marker: std::marker::PhantomData,
+        })
+    }
+}
+
+impl<T: Depacketizer + Default + 'static> Depayloader for BufferedDepayloader<T> {
+    fn depayload(
+        &mut self,
+        packet: RtpPacket,
+    ) -> Result<Vec<EncodedInputEvent>, DepayloadingError> {
+        trace!(?packet, "RTP depayloader received new packet");
+        // Workaround for a webrtc-rs `Vp9Packet::depacketize` bug — construct a fresh `T` per packet
+        // instead of reusing `self.depayloader`.
+        //
+        // Vp9Packet pushes into `pdiff` / `pgpdiff` / `width` / `height` Vecs without ever clearing them,
+        // so reusing one instance across RTP packets makes `pdiff.len()` grow until it trips
+        // `ErrTooManyPDiff` (MAX_VP9REF_PICS = 3) — even on streams with valid, gap-free sequence numbers.
+        //
+        // Safe to construct per-call: depacketize only reads `self` fields it wrote earlier in the same
+        // call (no cross-packet state needed), and Vp8Packet has no accumulating Vecs to worry about.
+        // Cross-packet assembly is carried by `self.buffer` below, not by the depacketizer.
+        let chunk = T::default().depacketize(&packet.packet.payload)?;
+
+        if chunk.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        self.buffer.push(chunk);
+        if !packet.packet.header.marker {
+            // the marker bit is set on the last packet of an access unit
+            return Ok(Vec::new());
+        }
+
+        let new_chunk = EncodedInputEvent::Chunk(EncodedInputChunk {
+            data: mem::take(&mut self.buffer).concat().into(),
+            pts: packet.timestamp,
+            dts: None,
+            kind: self.kind,
+            decode_only: false,
+        });
+
+        trace!(chunk=?new_chunk, "RTP depayloader produced a new chunk");
+        Ok(vec![new_chunk])
+    }
+}
+
+struct SimpleDepayloader<T: Depacketizer + Default + 'static> {
+    kind: MediaKind,
+    depayloader: T,
+}
+
+impl<T: Depacketizer + Default + 'static> SimpleDepayloader<T> {
+    fn new_boxed(kind: MediaKind) -> Box<dyn Depayloader> {
+        Box::new(Self {
+            kind,
+            depayloader: T::default(),
+        })
+    }
+}
+
+impl<T: Depacketizer + Default + 'static> Depayloader for SimpleDepayloader<T> {
+    fn depayload(
+        &mut self,
+        packet: RtpPacket,
+    ) -> Result<Vec<EncodedInputEvent>, DepayloadingError> {
+        trace!(?packet, "RTP depayloader received new packet");
+        let data = self.depayloader.depacketize(&packet.packet.payload)?;
+        if data.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let chunk = EncodedInputEvent::Chunk(EncodedInputChunk {
+            data,
+            pts: packet.timestamp,
+            dts: None,
+            kind: self.kind,
+            decode_only: false,
+        });
+
+        if packet.packet.header.marker {
+            trace!(?chunk, "RTP depayloader produced a new chunk (last in au)");
+            Ok(vec![chunk, EncodedInputEvent::AuDelimiter])
+        } else {
+            trace!(?chunk, "RTP depayloader produced a new chunk");
+            Ok(vec![chunk])
+        }
+    }
+}

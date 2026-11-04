@@ -1,0 +1,18 @@
+[package]
+name = "libcef"
+version = "0.1.0"
+edition = "2024"
+license-file = "../LICENSE"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+libcef-sys = { path = "libcef-sys" }
+fs_extra = { workspace = true }
+thiserror = { workspace = true }
+widestring = "1.0.2"
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

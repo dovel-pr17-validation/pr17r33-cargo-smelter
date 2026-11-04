@@ -1,0 +1,19 @@
+{
+    "json.schemas": [
+        {
+            "fileMatch": [
+                "*.scene.json"
+            ],
+            "url": "./tools/schemas/scene.schema.json"
+        }
+    ],
+    "eslint.workingDirectories": [
+      { "directory": "./demos", "changeProcessCWD": true },
+      { "directory": "./ts", "changeProcessCWD": true },
+      { "directory": "./docs", "changeProcessCWD": true }
+    ],
+    "prettier.requireConfig": true,
+    "prettier.configPath": "",
+    "editor.formatOnSave": true,
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+}

@@ -1,0 +1,78 @@
+[package]
+name = "smelter-core"
+version = "0.6.0"
+edition = "2024"
+license-file = "../LICENSE"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features]
+default = []
+decklink = ["dep:decklink"]
+web-renderer = ["smelter-render/web-renderer"]
+gpu-video = ["dep:ash"]
+
+[dependencies]
+smelter-render = { workspace = true }
+bytes = { workspace = true }
+crossbeam-channel = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+ffmpeg-next = { workspace = true }
+webrtc = { workspace = true }
+webrtc-util = { workspace = true }
+socket2 = { workspace = true }
+opus = { workspace = true }
+rand = { workspace = true }
+rtmp = { workspace = true }
+mp4 = { git = "https://github.com/smelter-labs/mp4-rust.git", branch = "preserve-asc" }
+reqwest = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+fdk-aac-sys = "0.5.0"
+rubato = { workspace = true }
+wgpu = { workspace = true }
+gpu-video = { workspace = true }
+h264-reader = { workspace = true }
+memchr = "2.7.4"
+glyphon = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+schemars = { workspace = true }
+utoipa = { workspace = true }
+axum = { version = "0.7.7", features = ["macros"] }
+tower-http = { workspace = true }
+url = "2.5.2"
+urlencoding = "2.1.3"
+itertools = { workspace = true }
+uuid = "1.17.0"
+pollster = { workspace = true }
+audioadapter-buffers = "2.0.0"
+audioadapter = "2.0.0"
+async-trait = "0.1.89"
+ash = { workspace = true, optional = true }
+hang = "0.19"
+moq-msf = "0.2"
+moq-mux = "0.5.6"
+mp4-atom = "0.11"
+moq-native = { workspace = true }
+data-encoding = "2"
+rcgen = "0.14"
+rustls-webpki = "0.103"
+sha2 = "0.10"
+dirs = "5.0"
+time = "0.3"
+sha3 = "0.12"
+
+[target.x86_64-unknown-linux-gnu.dependencies]
+decklink = { path = "../decklink", optional = true }
+v4l = "0.14.0"
+
+[target.aarch64-unknown-linux-gnu.dependencies]
+v4l = "0.14.0"
+
+[dev-dependencies]
+const-random = "0.1"
+
+[lints]
+workspace = true

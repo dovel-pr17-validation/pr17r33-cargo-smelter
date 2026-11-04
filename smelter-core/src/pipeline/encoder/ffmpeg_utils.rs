@@ -1,0 +1,148 @@
+use ffmpeg_next::{
+    Codec, Dictionary, Rational, Rescale, codec::encoder, ffi::avcodec_open2, format::Pixel, frame,
+};
+
+use smelter_render::FrameData;
+
+use crate::pipeline::ffmpeg_utils::{FfmpegOptions, warn_unused_options};
+
+use crate::prelude::*;
+
+const NS_TIME_BASE: Rational = Rational(1, 1_000_000_000);
+
+/// Same as `open_as_with`, but logs options that the encoder ignored.
+pub(super) fn open_video_encoder(
+    mut encoder: encoder::video::Video,
+    codec: Codec,
+    options: FfmpegOptions,
+) -> Result<encoder::Video, ffmpeg_next::Error> {
+    let unused = unsafe {
+        let mut options = options.into_dictionary().disown();
+        let result = avcodec_open2(encoder.as_mut_ptr(), codec.as_ptr(), &mut options);
+        let unused = Dictionary::own(options);
+        if result < 0 {
+            return Err(ffmpeg_next::Error::from(result));
+        }
+        unused
+    };
+    warn_unused_options(&unused, codec.name());
+    Ok(encoder::Video(encoder))
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Failed to create libav frame: {0}")]
+pub(super) struct FrameConversionError(String);
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum ChunkFromFfmpegError {
+    #[error("No data")]
+    NoData,
+    #[error("No pts")]
+    NoPts,
+}
+
+pub(super) fn create_av_frame(
+    frame: Frame,
+    time_base: i32,
+) -> Result<frame::Video, FrameConversionError> {
+    let (data, pixel_format) = match frame.data {
+        FrameData::PlanarYuv420(data) => (data, Pixel::YUV420P),
+        FrameData::PlanarYuv422(data) => (data, Pixel::YUV422P),
+        FrameData::PlanarYuv444(data) => (data, Pixel::YUV444P),
+        _ => {
+            return Err(FrameConversionError(format!(
+                "Unsupported pixel format {:?}",
+                frame.data
+            )));
+        }
+    };
+
+    let mut av_frame = frame::Video::new(
+        pixel_format,
+        frame.resolution.width as u32,
+        frame.resolution.height as u32,
+    );
+
+    let expected_y_plane_size = (av_frame.plane_width(0) * av_frame.plane_height(0)) as usize;
+    let expected_u_plane_size = (av_frame.plane_width(1) * av_frame.plane_height(1)) as usize;
+    let expected_v_plane_size = (av_frame.plane_width(2) * av_frame.plane_height(2)) as usize;
+    if expected_y_plane_size != data.y_plane.len() {
+        return Err(FrameConversionError(format!(
+            "Y plane is a wrong size, expected: {} received: {}",
+            expected_y_plane_size,
+            data.y_plane.len()
+        )));
+    }
+    if expected_u_plane_size != data.u_plane.len() {
+        return Err(FrameConversionError(format!(
+            "U plane is a wrong size, expected: {} received: {}",
+            expected_u_plane_size,
+            data.u_plane.len()
+        )));
+    }
+    if expected_v_plane_size != data.v_plane.len() {
+        return Err(FrameConversionError(format!(
+            "V plane is a wrong size, expected: {} received: {}",
+            expected_v_plane_size,
+            data.v_plane.len()
+        )));
+    }
+
+    av_frame.set_pts(Some(Rescale::rescale(
+        &frame.pts.as_nanos(),
+        NS_TIME_BASE,
+        Rational(1, time_base),
+    )));
+
+    write_plane_to_av_frame(&mut av_frame, 0, &data.y_plane);
+    write_plane_to_av_frame(&mut av_frame, 1, &data.u_plane);
+    write_plane_to_av_frame(&mut av_frame, 2, &data.v_plane);
+
+    Ok(av_frame)
+}
+
+fn write_plane_to_av_frame(frame: &mut frame::Video, plane: usize, data: &[u8]) {
+    let stride = frame.stride(plane);
+    let width = frame.plane_width(plane) as usize;
+
+    data.chunks(width)
+        .zip(frame.data_mut(plane).chunks_mut(stride))
+        .for_each(|(data, target)| target[..width].copy_from_slice(data));
+}
+
+pub(super) fn encoded_chunk_from_av_packet(
+    packet: &ffmpeg_next::Packet,
+    kind: MediaKind,
+    time_base: i32,
+) -> Result<EncodedOutputChunk, ChunkFromFfmpegError> {
+    let data = match packet.data() {
+        Some(data) => bytes::Bytes::copy_from_slice(data),
+        None => return Err(ChunkFromFfmpegError::NoData),
+    };
+
+    let rescale =
+        |v: i64| Timestamp::from_nanos(Rescale::rescale(&v, Rational(1, time_base), NS_TIME_BASE));
+
+    let Some(pts) = packet.pts().map(rescale) else {
+        return Err(ChunkFromFfmpegError::NoPts);
+    };
+    let dts = packet.dts().map(rescale);
+
+    Ok(EncodedOutputChunk {
+        data,
+        pts,
+        dts,
+        is_keyframe: packet.flags().contains(ffmpeg_next::packet::Flags::KEY),
+        kind,
+    })
+}
+
+pub(super) fn into_ffmpeg_pixel_format(
+    pixel_format: OutputPixelFormat,
+) -> ffmpeg_next::format::Pixel {
+    match pixel_format {
+        OutputPixelFormat::YUV420P => ffmpeg_next::format::Pixel::YUV420P,
+        OutputPixelFormat::YUV422P => ffmpeg_next::format::Pixel::YUV422P,
+        OutputPixelFormat::YUV444P => ffmpeg_next::format::Pixel::YUV444P,
+    }
+}

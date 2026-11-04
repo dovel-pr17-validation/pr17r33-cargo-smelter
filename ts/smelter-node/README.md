@@ -1,0 +1,58 @@
+# `@swmansion/smelter-node`
+
+Provides API to create and manage Smelter instances for Node.js environment.
+
+When you call `registerOutput` on the Smelter instance, you can pass a `ReactElement` that represents a component tree built from components included in `@swmansion/smelter` package. Those components will define what will be rendered on the output stream.
+
+## Usage
+
+```tsx
+import Smelter from '@swmansion/smelter-node';
+import { View, Text } from '@swmansion/smelter';
+
+function ExampleApp() {
+  return (
+    <View>
+      <Text style={{ fontSize: 20 }}>Hello world</Text>
+    </View>
+  );
+}
+
+async function run() {
+  const smelter = new Smelter();
+  await smelter.init();
+
+  // register input/outputs/images/shaders/...
+
+  await smelter.registerOutput('example_output', <SmelterApp />, {
+    type: 'rtmp_client',
+    url: 'rtmp://127.0.0.1:8000/',
+    video: {
+      encoder: { type: 'ffmpeg_h264', ffmpegOptions: { preset: 'ultrafast' } },
+      resolution: { width: 1920, height: 1080 },
+    },
+    audio: {
+      encoder: { type: 'opus', channels: 'stereo' },
+    },
+  });
+
+  await smelter.start();
+}
+run();
+```
+
+Before running above code start listening on port 8000 for incoming RTMP stream
+e.g. `ffmpeg -f flv -listen 1 -i rtmp://0.0.0.0:8000 -vcodec copy  -f flv - | ffplay -f flv -i -`.
+
+See our [docs](https://smelter.dev/docs) to learn more.
+
+## License
+
+`@swmansion/smelter-node` is MIT licensed, but internally it is downloading and using Smelter server that is licensed
+under a [custom license](https://github.com/software-mansion/smelter/blob/master/LICENSE).
+
+## Smelter is created by Software Mansion
+
+<a href="https://swmansion.com"><img width="150" height="80" alt="Software Mansion" src="https://github.com/user-attachments/assets/cacd6185-78b0-4e76-8767-016d6389bb2b" /></a>
+
+Since 2012 [Software Mansion](https://swmansion.com) is a software agency with experience in building web and mobile apps as well as complex multimedia solutions. We are Core React Native Contributors and experts in live streaming and broadcasting technologies. We can help you build your next dream product – [Hire us](https://swmansion.com/contact/projects?utm_source=smelter&utm_medium=readme).

@@ -1,0 +1,772 @@
+use std::{
+    collections::HashMap,
+    env,
+    path::Path,
+    sync::{Arc, Mutex, Weak},
+    thread,
+    time::Duration,
+};
+
+use crossbeam_channel::{Receiver, bounded};
+use glyphon::fontdb;
+use rtmp::RtmpServer;
+use tokio::runtime::{Builder, Runtime};
+use tracing::{Level, debug, error, info, span, trace, warn};
+
+use smelter_render::{
+    FrameSet, InputId, OutputId, RegistryType, Renderer, RendererId, RendererOptions, RendererSpec,
+    error::{
+        ErrorStack, RegisterFontError, RegisterRendererError, RequestKeyframeError,
+        UnregisterRendererError, UpdateSceneError,
+    },
+    scene::Component,
+};
+
+use crate::{
+    audio_mixer::AudioMixer,
+    event::{Event, EventEmitter},
+    graphics_context::{GraphicsContext, GraphicsContextOptions},
+    pipeline::{
+        MoqPipelineState, RtmpPipelineState,
+        channel::{EncodedDataOutput, RawDataInput, RawDataOutput},
+        input::{PipelineInput, new_external_input, register_pipeline_input},
+        moq::{MoqServer, spawn_moq_server},
+        output::{
+            OutputSender, OutputState, PipelineOutput, new_external_output,
+            register_pipeline_output,
+        },
+        rtmp::spawn_rtmp_server,
+        webrtc::{
+            UdpMuxHandle, WebrtcSettingEngineCtx, WhipWhepPipelineState, WhipWhepServer,
+            WhipWhepServerHandle,
+        },
+    },
+    queue::{Queue, QueueAudioOutput, QueueOptions, QueueVideoOutput},
+    stats::StatsMonitor,
+};
+
+use crate::prelude::*;
+
+/// Methods are blocking and may use `Runtime::block_on` internally. Do not call them from async
+/// code, use `spawn_blocking` or a regular thread instead.
+pub struct Pipeline {
+    pub(super) inputs: HashMap<InputId, PipelineInput>,
+    pub(super) outputs: HashMap<OutputId, PipelineOutput>,
+    pub(super) queue: Arc<Queue>,
+    pub(super) renderer: Renderer,
+    pub(super) stats_monitor: StatsMonitor,
+
+    pub(super) ctx: Arc<PipelineCtx>,
+    pub(super) audio_mixer: AudioMixer,
+    pub(super) is_started: bool,
+
+    #[allow(dead_code)]
+    // triggers cleanup on drop
+    whip_whep_handle: Option<WhipWhepServerHandle>,
+
+    #[allow(dead_code)]
+    // triggers cleanup on drop
+    rtmp_server: Option<RtmpServer>,
+
+    #[allow(dead_code)]
+    moq_server: Option<MoqServer>,
+
+    #[allow(dead_code)]
+    // triggers cleanup on drop
+    udp_mux_handle: Option<UdpMuxHandle>,
+
+    /// Runtime for all async tasks of this pipeline, shut down on drop. Always `Some` until drop.
+    tokio_rt: Option<Runtime>,
+}
+
+impl Pipeline {
+    pub fn new(opts: PipelineOptions) -> Result<Self, InitPipelineError> {
+        create_pipeline(opts)
+    }
+
+    pub fn queue(&self) -> &Queue {
+        &self.queue
+    }
+
+    pub fn stats(&self) -> StatsReport {
+        self.stats_monitor.report()
+    }
+
+    pub fn subscribe_pipeline_events(&self) -> Receiver<Event> {
+        self.ctx.event_emitter.subscribe()
+    }
+
+    pub fn register_input(
+        pipeline: &Arc<Mutex<Self>>,
+        input_id: InputId,
+        options: RegisterInputOptions,
+    ) -> Result<InputInitInfo, RegisterInputError> {
+        register_pipeline_input(pipeline, input_id, options.kind(), |ctx, input_id| {
+            new_external_input(ctx, input_id, options)
+        })
+    }
+
+    pub fn register_raw_data_input(
+        pipeline: &Arc<Mutex<Self>>,
+        input_id: InputId,
+        raw_input_options: RawDataInputOptions,
+    ) -> Result<RawDataInputSender, RegisterInputError> {
+        register_pipeline_input(
+            pipeline,
+            input_id,
+            InputProtocolKind::RawDataChannel,
+            |ctx, input_id| RawDataInput::new_input(ctx, input_id, raw_input_options),
+        )
+    }
+
+    pub fn update_input(
+        &self,
+        input_id: &InputId,
+        pause: Option<bool>,
+        seek: Option<Duration>,
+    ) -> Result<(), UpdateInputError> {
+        let input = self
+            .inputs
+            .get(input_id)
+            .ok_or_else(|| UpdateInputError::NotFound(input_id.clone()))?;
+
+        if let Some(pause) = pause {
+            match pause {
+                true => input.input.pause()?,
+                false => input.input.resume()?,
+            }
+        }
+
+        if let Some(seek) = seek {
+            input.input.seek(seek)?;
+        }
+        Ok(())
+    }
+
+    pub fn unregister_input(&mut self, input_id: &InputId) -> Result<(), UnregisterInputError> {
+        if !self.inputs.contains_key(input_id) {
+            return Err(UnregisterInputError::NotFound(input_id.clone()));
+        }
+
+        self.inputs.remove(input_id);
+        self.queue.remove_input(input_id);
+        self.renderer.unregister_input(input_id);
+        self.audio_mixer.unregister_input(input_id);
+        for output in self.outputs.values_mut() {
+            if let Some(cond) = output.audio_end_condition_mut() {
+                cond.on_input_unregistered(input_id);
+            }
+            if let Some(cond) = output.video_end_condition_mut() {
+                cond.on_input_unregistered(input_id);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn register_output(
+        pipeline: &Arc<Mutex<Self>>,
+        output_id: OutputId,
+        register_options: RegisterOutputOptions,
+    ) -> Result<OutputInitInfo, RegisterOutputError> {
+        let RegisterOutputOptions {
+            output_options,
+            video,
+            audio,
+        } = register_options;
+        let start_at = output_options.start_at();
+
+        register_pipeline_output(
+            pipeline,
+            output_id,
+            output_options.kind(),
+            video,
+            audio,
+            start_at,
+            |ctx, output_ref| new_external_output(ctx, output_ref, output_options),
+        )
+    }
+
+    pub fn register_encoded_data_output(
+        pipeline: &Arc<Mutex<Self>>,
+        output_id: OutputId,
+        register_options: RegisterEncodedDataOutputOptions,
+    ) -> Result<EncodedDataOutputHandle, RegisterOutputError> {
+        register_pipeline_output(
+            pipeline,
+            output_id,
+            OutputProtocolKind::EncodedDataChannel,
+            register_options.video,
+            register_options.audio,
+            None,
+            |ctx, output_ref| {
+                let (output, handle) =
+                    EncodedDataOutput::new(ctx, output_ref, register_options.output_options)?;
+                Ok((Box::new(output), handle))
+            },
+        )
+    }
+
+    pub fn register_raw_data_output(
+        pipeline: &Arc<Mutex<Self>>,
+        output_id: OutputId,
+        register_options: RegisterRawDataOutputOptions,
+    ) -> Result<RawDataOutputReceiver, RegisterOutputError> {
+        register_pipeline_output(
+            pipeline,
+            output_id,
+            OutputProtocolKind::RawDataChannel,
+            register_options.video,
+            register_options.audio,
+            None,
+            |_ctx, _output_ref| {
+                let (output, result) = RawDataOutput::new(register_options.output_options)?;
+                Ok((Box::new(output), result))
+            },
+        )
+    }
+
+    pub fn unregister_output(&mut self, output_id: &OutputId) -> Result<(), UnregisterOutputError> {
+        if !self.outputs.contains_key(output_id) {
+            return Err(UnregisterOutputError::NotFound(output_id.clone()));
+        }
+
+        self.audio_mixer.unregister_output(output_id);
+        self.outputs.remove(output_id);
+        self.renderer.unregister_output(output_id);
+        Ok(())
+    }
+
+    pub fn register_renderer(
+        pipeline: &Arc<Mutex<Self>>,
+        renderer_id: RendererId,
+        transformation_spec: RendererSpec,
+    ) -> Result<(), RegisterRendererError> {
+        let renderer = pipeline.lock().unwrap().renderer.clone();
+        renderer.register_renderer(renderer_id, transformation_spec)?;
+        Ok(())
+    }
+
+    pub fn unregister_renderer(
+        &self,
+        renderer_id: &RendererId,
+        registry_type: RegistryType,
+    ) -> Result<(), UnregisterRendererError> {
+        self.renderer
+            .unregister_renderer(renderer_id, registry_type)
+    }
+
+    pub fn update_output(
+        &mut self,
+        output_id: OutputId,
+        video: Option<Component>,
+        audio: Option<AudioMixerConfig>,
+    ) -> Result<(), UpdateSceneError> {
+        self.check_output_spec(&output_id, &video, &audio)?;
+        if let Some(video) = video {
+            self.update_scene_root(output_id.clone(), video)?;
+        }
+
+        if let Some(audio) = audio {
+            self.update_audio(&output_id, audio)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn request_keyframe(&self, output_id: OutputId) -> Result<(), RequestKeyframeError> {
+        let Some(output) = self.outputs.get(&output_id) else {
+            return Err(RequestKeyframeError::OutputNotRegistered(output_id.clone()));
+        };
+
+        match output.output.video() {
+            Some(video) => video
+                .keyframe_request_sender
+                .send(())
+                .map_err(|_| RequestKeyframeError::KeyframesUnsupported(output_id.clone())),
+            None => Err(RequestKeyframeError::NoVideoOutput(output_id.clone())),
+        }
+    }
+
+    pub fn register_font(&self, font_source: fontdb::Source) -> Result<(), RegisterFontError> {
+        self.renderer.register_font(font_source)
+    }
+
+    fn check_output_spec(
+        &self,
+        output_id: &OutputId,
+        video: &Option<Component>,
+        audio: &Option<AudioMixerConfig>,
+    ) -> Result<(), UpdateSceneError> {
+        let Some(output) = self.outputs.get(output_id) else {
+            return Err(UpdateSceneError::OutputNotRegistered(output_id.clone()));
+        };
+        if output.has_audio() != audio.is_some() || output.has_video() != video.is_some() {
+            return Err(UpdateSceneError::AudioVideoNotMatching(output_id.clone()));
+        }
+        if video.is_none() && audio.is_none() {
+            return Err(UpdateSceneError::NoAudioAndVideo(output_id.clone()));
+        }
+        Ok(())
+    }
+
+    fn update_scene_root(
+        &mut self,
+        output_id: OutputId,
+        scene_root: Component,
+    ) -> Result<(), UpdateSceneError> {
+        let output = self
+            .outputs
+            .get_mut(&output_id)
+            .ok_or_else(|| UpdateSceneError::OutputNotRegistered(output_id.clone()))?;
+
+        if let Some(cond) = output.video_end_condition()
+            && cond.did_output_end()
+        {
+            // Ignore updates after EOS
+            warn!("Received output update on a finished output");
+            return Ok(());
+        }
+
+        let Some(video_output) = output.output.video() else {
+            return Err(UpdateSceneError::AudioVideoNotMatching(output_id));
+        };
+
+        info!(?output_id, "Update scene {:?}", scene_root);
+
+        if let OutputState::NotStarted { video, .. } = &mut output.state {
+            // Output is not connected to the renderer yet, update the scene it will start with.
+            if let Some(video) = video {
+                video.initial = scene_root;
+            }
+            return Ok(());
+        }
+
+        self.renderer.update_scene(
+            output_id,
+            video_output.resolution,
+            video_output.frame_format,
+            scene_root,
+        )
+    }
+
+    fn update_audio(
+        &mut self,
+        output_id: &OutputId,
+        audio: AudioMixerConfig,
+    ) -> Result<(), UpdateSceneError> {
+        let output = self
+            .outputs
+            .get_mut(output_id)
+            .ok_or_else(|| UpdateSceneError::OutputNotRegistered(output_id.clone()))?;
+
+        if let Some(cond) = output.audio_end_condition()
+            && cond.did_output_end()
+        {
+            // Ignore updates after EOS
+            warn!("Received output update on a finished output");
+            return Ok(());
+        }
+
+        info!(?output_id, "Update audio mixer {:?}", audio);
+
+        if let OutputState::NotStarted {
+            audio: audio_opts, ..
+        } = &mut output.state
+        {
+            // Output is not connected to the audio mixer yet, update the config it will start with.
+            if let Some(audio_opts) = audio_opts {
+                audio_opts.initial = audio;
+            }
+            return Ok(());
+        }
+
+        self.audio_mixer.update_output(output_id, audio)
+    }
+
+    pub fn start(pipeline: &Arc<Mutex<Self>>) {
+        let mut guard = pipeline.lock().unwrap();
+        if guard.is_started {
+            error!("Pipeline already started.");
+            return;
+        }
+        guard.is_started = true;
+        info!("Starting pipeline.");
+        let (video_sender, video_receiver) = bounded(2);
+        let (audio_sender, audio_receiver) = bounded(100);
+        guard.queue.start(video_sender, audio_sender);
+
+        let weak_pipeline = Arc::downgrade(pipeline);
+        thread::spawn(move || run_renderer_thread(weak_pipeline, video_receiver));
+
+        let weak_pipeline = Arc::downgrade(pipeline);
+        thread::spawn(move || run_audio_mixer_thread(weak_pipeline, audio_receiver));
+    }
+
+    pub fn inputs(&self) -> impl Iterator<Item = (&InputId, InputInfo)> {
+        self.inputs.iter().map(|(id, input)| {
+            let protocol = input.input.kind();
+            (id, InputInfo { protocol })
+        })
+    }
+
+    pub fn schedule_event<F: FnOnce(&mut Self) + Send + 'static>(
+        pipeline: &Arc<Mutex<Self>>,
+        pts: Timestamp,
+        late_policy: LateEventPolicy,
+        callback: F,
+    ) {
+        let weak = Arc::downgrade(pipeline);
+        // Do not hold the pipeline lock across `queue.schedule_event(...)`.
+        // That call may block on a rendezvous (`bounded(0)`) send, and the
+        // scheduled callback may later need to acquire the pipeline lock.
+        let queue = pipeline.lock().unwrap().queue.clone();
+        queue.schedule_event(
+            pts,
+            late_policy,
+            Box::new(move || {
+                let Some(pipeline) = weak.upgrade() else {
+                    warn!("Unable to call scheduled callback. Pipeline already dropped.");
+                    return;
+                };
+                let mut guard = pipeline.lock().unwrap();
+                callback(&mut guard)
+            }),
+        );
+    }
+
+    pub fn outputs(&self) -> impl Iterator<Item = (&OutputId, OutputInfo)> {
+        self.outputs.iter().map(|(id, output)| {
+            let protocol = output.output.kind();
+            (id, OutputInfo { protocol })
+        })
+    }
+}
+
+impl Drop for Pipeline {
+    fn drop(&mut self) {
+        info!("Stopping pipeline");
+        // Does not wait for blocking tasks, so it is safe to drop the pipeline in async code.
+        if let Some(tokio_rt) = self.tokio_rt.take() {
+            tokio_rt.shutdown_background();
+        }
+    }
+}
+
+fn run_renderer_thread(
+    pipeline: Weak<Mutex<Pipeline>>,
+    frames_receiver: Receiver<QueueVideoOutput>,
+) {
+    let renderer = match pipeline.upgrade() {
+        Some(pipeline) => pipeline.lock().unwrap().renderer.clone(),
+        None => {
+            warn!("Pipeline stopped before render thread was started.");
+            return;
+        }
+    };
+
+    for input_frames in frames_receiver.iter() {
+        let Some(pipeline) = pipeline.upgrade() else {
+            break;
+        };
+        for (input_id, event) in input_frames.frames.iter() {
+            if event.is_eos {
+                let mut guard = pipeline.lock().unwrap();
+                if let Some(input) = guard.inputs.get_mut(input_id) {
+                    info!(?input_id, "Received video EOS on input.");
+                    input.on_video_eos();
+                }
+                for output in guard.outputs.values_mut() {
+                    if let Some(cond) = output.video_end_condition_mut() {
+                        cond.on_input_eos(input_id);
+                    }
+                }
+            }
+        }
+
+        let output_frame_senders: HashMap<_, _> =
+            Pipeline::all_output_video_senders_iter(&pipeline)
+                .filter_map(|(output_id, sender)| match sender {
+                    OutputSender::ActiveSender(sender) => Some((output_id, sender)),
+                    OutputSender::FinishedSender => {
+                        renderer.unregister_output(&output_id);
+                        None
+                    }
+                })
+                .collect();
+
+        let input_frames: FrameSet<InputId> = input_frames.into();
+        trace!(?input_frames, "Rendering frames");
+        let output_frames = renderer.render(input_frames);
+        let Ok(output_frames) = output_frames else {
+            error!(
+                "Error while rendering: {}",
+                ErrorStack::new(&output_frames.unwrap_err()).into_string()
+            );
+            continue;
+        };
+
+        for (output_id, frame) in output_frames.frames {
+            let Some(frame_sender) = output_frame_senders.get(&output_id) else {
+                warn!(?output_id, "Received new frame from renderer after EOS.");
+                continue;
+            };
+
+            if frame_sender
+                .send(PipelineEvent::Data(frame.into()))
+                .is_err()
+            {
+                warn!(?output_id, "Failed to send output frames. Channel closed.");
+                renderer.unregister_output(&output_id);
+            }
+        }
+    }
+    info!("Stopping renderer thread.")
+}
+
+fn run_audio_mixer_thread(
+    pipeline: Weak<Mutex<Pipeline>>,
+    audio_receiver: Receiver<QueueAudioOutput>,
+) {
+    let audio_mixer = match pipeline.upgrade() {
+        Some(pipeline) => pipeline.lock().unwrap().audio_mixer.clone(),
+        None => {
+            warn!("Pipeline stopped before mixer thread was started.");
+            return;
+        }
+    };
+
+    let _span = span!(Level::INFO, "AudioMixer").entered();
+    for samples in audio_receiver.iter() {
+        trace!(?samples, "Received samples from queue");
+        let Some(pipeline) = pipeline.upgrade() else {
+            break;
+        };
+
+        trace!("Handle potential EOS");
+        for (input_id, event) in samples.samples.iter() {
+            if event.is_eos {
+                let mut guard = pipeline.lock().unwrap();
+                if let Some(input) = guard.inputs.get_mut(input_id) {
+                    info!(?input_id, "Received audio EOS on input.");
+                    input.on_audio_eos();
+                }
+                for output in guard.outputs.values_mut() {
+                    if let Some(cond) = output.audio_end_condition_mut() {
+                        cond.on_input_eos(input_id);
+                    }
+                }
+            }
+        }
+
+        trace!("Prepare output senders");
+        let output_samples_senders: HashMap<_, _> =
+            Pipeline::all_output_audio_senders_iter(&pipeline)
+                .filter_map(|(output_id, sender)| match sender {
+                    OutputSender::ActiveSender(sender) => Some((output_id, sender)),
+                    OutputSender::FinishedSender => {
+                        audio_mixer.unregister_output(&output_id);
+                        None
+                    }
+                })
+                .collect();
+
+        trace!("Mix audio");
+        let mixed_samples = audio_mixer.process_batch_set(samples.into());
+
+        for (output_id, batch) in mixed_samples.0 {
+            trace!(?output_id, ?batch, "Send batch");
+            let Some(samples_sender) = output_samples_senders.get(&output_id) else {
+                warn!(?output_id, "Received new mixed samples after EOS.");
+                continue;
+            };
+
+            if samples_sender.send(PipelineEvent::Data(batch)).is_err() {
+                warn!(?output_id, "Failed to send mixed audio. Channel closed.");
+                audio_mixer.unregister_output(&output_id);
+            }
+        }
+    }
+    info!("Stopping audio mixer thread.")
+}
+
+fn create_pipeline(opts: PipelineOptions) -> Result<Pipeline, InitPipelineError> {
+    let queue_options = QueueOptions::from(&opts);
+
+    let graphics_context = match opts.wgpu_options {
+        PipelineWgpuOptions::Context(ctx) => ctx,
+        PipelineWgpuOptions::Options {
+            device_id,
+            driver_name,
+            features,
+            force_gpu,
+        } => GraphicsContext::new(GraphicsContextOptions {
+            device_id,
+            driver_name,
+            force_gpu,
+            features,
+            ..Default::default()
+        })?,
+    };
+
+    let renderer = Renderer::new(RendererOptions {
+        chromium_context: opts.chromium_context,
+        framerate: opts.output_framerate,
+        load_system_fonts: opts.load_system_fonts,
+        device: graphics_context.device.clone(),
+        queue: graphics_context.queue.clone(),
+        rendering_mode: opts.rendering_mode,
+        max_layouts_count: opts.max_layouts_count,
+    })?;
+
+    let download_dir = opts
+        .download_root
+        .join(format!("smelter-{}", rand::random::<u64>()))
+        .into();
+    std::fs::create_dir_all(&download_dir).map_err(InitPipelineError::CreateDownloadDir)?;
+
+    if let Some(dir) = opts.side_channel_socket_dir.as_deref() {
+        prepare_side_channel_socket_dir(dir)?;
+    }
+
+    let tokio_rt = create_tokio_runtime().map_err(InitPipelineError::CreateTokioRuntime)?;
+
+    let (stats_monitor, stats_sender) = StatsMonitor::new();
+
+    let rtmp_state = match opts.rtmp_server {
+        PipelineRtmpServerOptions::Enable { port, tls_config } => {
+            Some(RtmpPipelineState::new(port, tls_config))
+        }
+        PipelineRtmpServerOptions::Disable => None,
+    };
+
+    let moq_state = match opts.moq_server {
+        PipelineMoqServerOptions::Enable { port, tls_config } => {
+            Some(MoqPipelineState::new(port, tls_config)?)
+        }
+        PipelineMoqServerOptions::Disable => None,
+    };
+
+    let (webrtc_setting_engine, udp_mux_handle) = WebrtcSettingEngineCtx::new(
+        opts.webrtc_nat_1to1_ips,
+        opts.webrtc_udp_port_strategy,
+        tokio_rt.handle(),
+    )?;
+
+    let queue = Queue::new(queue_options);
+    let ctx = Arc::new(PipelineCtx {
+        queue_ctx: queue.ctx(),
+        default_buffer_duration: opts.default_buffer_duration,
+        stale_frame_timeout: opts.stale_frame_timeout,
+
+        mixing_sample_rate: opts.mixing_sample_rate,
+        output_framerate: opts.output_framerate,
+
+        download_dir,
+        event_emitter: Arc::new(EventEmitter::new()),
+        stats_sender,
+        tokio_rt: tokio_rt.handle().clone(),
+        graphics_context,
+        wgpu_ctx: renderer.wgpu_ctx(),
+        whip_whep_state: match opts.whip_whep_server {
+            PipelineWhipWhepServerOptions::Enable { port } => {
+                Some(WhipWhepPipelineState::new(port))
+            }
+            PipelineWhipWhepServerOptions::Disable => None,
+        },
+        webrtc_stun_servers: opts.webrtc_stun_servers.clone(),
+        webrtc_setting_engine,
+        rtmp_state: rtmp_state.clone(),
+        moq_state: moq_state.clone(),
+        moq_disable_tls_verification: opts.moq_disable_tls_verification,
+    });
+
+    let whip_whep_handle = match &ctx.whip_whep_state {
+        Some(state) => Some(WhipWhepServer::spawn(ctx.clone(), state)?),
+        None => None,
+    };
+
+    let rtmp_server = match rtmp_state.as_ref() {
+        Some(state) => Some(spawn_rtmp_server(ctx.clone(), state)?),
+        None => None,
+    };
+
+    let moq_server = match moq_state.as_ref() {
+        Some(state) => Some(ctx.block_on_async_task(|ctx| spawn_moq_server(ctx, state))?),
+        None => None,
+    };
+
+    let pipeline = Pipeline {
+        outputs: HashMap::new(),
+        inputs: HashMap::new(),
+        queue,
+        renderer,
+        stats_monitor,
+        audio_mixer: AudioMixer::new(opts.mixing_sample_rate),
+        is_started: false,
+        ctx,
+        whip_whep_handle,
+        rtmp_server,
+        moq_server,
+        udp_mux_handle,
+        tokio_rt: Some(tokio_rt),
+    };
+
+    Ok(pipeline)
+}
+
+/// Worker count defaults to the number of cores (or `TOKIO_WORKER_THREADS`), but at least 3.
+fn create_tokio_runtime() -> Result<Runtime, std::io::Error> {
+    const MINIMUM_WORKER_THREADS: usize = 3;
+
+    let worker_threads = if let Ok(thread_count) = env::var("TOKIO_WORKER_THREADS") {
+        match thread_count.trim().parse() {
+            Ok(t) if t > 0 => t,
+            _ => panic!("TOKIO_WORKER_THREADS must be a number greater than 0."),
+        }
+    } else if let Ok(thread_count) = thread::available_parallelism() {
+        thread_count.get()
+    } else {
+        MINIMUM_WORKER_THREADS
+    };
+    let worker_threads = usize::max(worker_threads, MINIMUM_WORKER_THREADS);
+
+    debug!(worker_threads, "Initializing Tokio runtime");
+    Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(worker_threads)
+        .build()
+}
+
+fn prepare_side_channel_socket_dir(dir: &Path) -> Result<(), InitPipelineError> {
+    if !dir.exists() {
+        return std::fs::create_dir_all(dir).map_err(|e| {
+            InitPipelineError::SideChannelSocketDir(format!(
+                "failed to create \"{}\": {e}",
+                dir.display()
+            ))
+        });
+    }
+    if !dir.is_dir() {
+        return Err(InitPipelineError::SideChannelSocketDir(format!(
+            "\"{}\" exists but is not a directory",
+            dir.display()
+        )));
+    }
+    let is_empty = dir
+        .read_dir()
+        .map_err(|e| {
+            InitPipelineError::SideChannelSocketDir(format!(
+                "failed to read \"{}\": {e}",
+                dir.display()
+            ))
+        })?
+        .next()
+        .is_none();
+    if !is_empty {
+        return Err(InitPipelineError::SideChannelSocketDir(format!(
+            "\"{}\" is not empty",
+            dir.display()
+        )));
+    }
+    Ok(())
+}

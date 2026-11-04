@@ -1,0 +1,151 @@
+use std::sync::Arc;
+
+use bytes::Bytes;
+use crossbeam_channel::Receiver;
+use smelter_render::scene::Component;
+
+use crate::prelude::*;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegisterOutputOptions {
+    pub output_options: ProtocolOutputOptions,
+    pub video: Option<RegisterOutputVideoOptions>,
+    pub audio: Option<RegisterOutputAudioOptions>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RegisterEncodedDataOutputOptions {
+    pub output_options: EncodedDataOutputOptions,
+    pub video: Option<RegisterOutputVideoOptions>,
+    pub audio: Option<RegisterOutputAudioOptions>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RegisterRawDataOutputOptions {
+    pub output_options: RawDataOutputOptions,
+    pub video: Option<RegisterOutputVideoOptions>,
+    pub audio: Option<RegisterOutputAudioOptions>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProtocolOutputOptions {
+    Rtp(RtpOutputOptions),
+    Rtmp(RtmpOutputOptions),
+    Mp4(Mp4OutputOptions),
+    Hls(HlsOutputOptions),
+    Whip(WhipOutputOptions),
+    Whep(WhepOutputOptions),
+    MoqClient(MoqClientOutputOptions),
+}
+
+impl ProtocolOutputOptions {
+    pub fn kind(&self) -> OutputProtocolKind {
+        match self {
+            ProtocolOutputOptions::Rtp(_) => OutputProtocolKind::Rtp,
+            ProtocolOutputOptions::Rtmp(_) => OutputProtocolKind::Rtmp,
+            ProtocolOutputOptions::Mp4(_) => OutputProtocolKind::Mp4,
+            ProtocolOutputOptions::Hls(_) => OutputProtocolKind::Hls,
+            ProtocolOutputOptions::Whip(_) => OutputProtocolKind::Whip,
+            ProtocolOutputOptions::Whep(_) => OutputProtocolKind::Whep,
+            ProtocolOutputOptions::MoqClient(_) => OutputProtocolKind::MoqClient,
+        }
+    }
+
+    /// Timestamp (relative to the queue start) the output should start producing data
+    /// at. Only supported by protocols that write to a file/playlist, where delaying the
+    /// start does not mean stalling a live connection.
+    pub fn start_at(&self) -> Option<Timestamp> {
+        match self {
+            ProtocolOutputOptions::Mp4(options) => options.start_at,
+            ProtocolOutputOptions::Hls(options) => options.start_at,
+            ProtocolOutputOptions::Rtp(_)
+            | ProtocolOutputOptions::Rtmp(_)
+            | ProtocolOutputOptions::Whip(_)
+            | ProtocolOutputOptions::Whep(_)
+            | ProtocolOutputOptions::MoqClient(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegisterOutputVideoOptions {
+    pub initial: Component,
+    pub end_condition: PipelineOutputEndCondition,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegisterOutputAudioOptions {
+    pub initial: AudioMixerConfig,
+    pub mixing_strategy: AudioMixingStrategy,
+    pub channels: AudioChannels,
+    pub end_condition: PipelineOutputEndCondition,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioMixerConfig {
+    pub inputs: Vec<AudioMixerInputConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioMixerInputConfig {
+    pub input_id: InputId,
+    // [0, 2] range of input volume
+    pub volume: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AudioMixingStrategy {
+    SumClip,
+    SumScale,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PipelineOutputEndCondition {
+    AnyOf(Vec<InputId>),
+    AllOf(Vec<InputId>),
+    AnyInput,
+    AllInputs,
+    Never,
+}
+
+pub enum OutputInitInfo {
+    Rtp { port: Port },
+    Whep { endpoint_route: Arc<str> },
+    Other,
+}
+
+#[derive(Debug)]
+pub struct OutputInfo {
+    pub protocol: OutputProtocolKind,
+}
+
+#[derive(Debug, Clone)]
+pub struct EncodedDataOutputHandle {
+    pub receiver: Receiver<EncodedOutputEvent>,
+    pub video: Option<VideoEncoderInfo>,
+    pub audio: Option<AudioEncoderInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct VideoEncoderInfo {
+    pub resolution: Resolution,
+    pub extradata: Option<Bytes>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AudioEncoderInfo {
+    pub extradata: Option<Bytes>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum OutputProtocolKind {
+    Rtp,
+    Rtmp,
+    Whip,
+    Whep,
+    Mp4,
+    Hls,
+    MoqClient,
+    EncodedDataChannel,
+    RawDataChannel,
+}

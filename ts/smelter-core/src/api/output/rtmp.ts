@@ -1,0 +1,101 @@
+import type { Api, Outputs, _smelterInternals } from '@swmansion/smelter';
+import type { RegisterOutputRequest } from '../output';
+import { intoOutputEosCondition, intoVideoEncoderBitrate } from './common';
+
+export function intoRegisterRtmpClientOutput(
+  output: Outputs.RegisterRtmpClientOutput,
+  initial: { video?: Api.VideoScene; audio?: Api.AudioScene }
+): RegisterOutputRequest {
+  return {
+    type: 'rtmp_client',
+    url: output.url,
+
+    video:
+      output.video &&
+      initial.video &&
+      intoOutputRtmpClientVideoOptions(output.video, initial.video),
+    audio:
+      output.audio &&
+      initial.audio &&
+      intoOutputRtmpClientAudioOptions(output.audio, initial.audio),
+  };
+}
+
+export function intoOutputRtmpClientVideoOptions(
+  video: Outputs.RtmpClientVideoOptions,
+  initial: Api.VideoScene
+): Api.OutputRtmpClientVideoOptions {
+  return {
+    resolution: video.resolution,
+    send_eos_when: video.sendEosWhen && intoOutputEosCondition(video.sendEosWhen),
+    encoder: intoRtmpClientVideoEncoderOptions(video.encoder),
+    initial,
+  };
+}
+
+function intoRtmpClientVideoEncoderOptions(
+  encoder: Outputs.RtmpClientVideoEncoderOptions
+): Api.RtmpClientVideoEncoderOptions {
+  switch (encoder.type) {
+    case 'ffmpeg_h264':
+      return {
+        type: 'ffmpeg_h264',
+        bitrate: encoder.bitrate && intoVideoEncoderBitrate(encoder.bitrate),
+        keyframe_interval_ms: encoder.keyframeIntervalMs,
+        encoder_name: encoder.encoderName,
+        pixel_format: encoder.pixelFormat,
+        ffmpeg_options: encoder.ffmpegOptions,
+      };
+    case 'ffmpeg_vp8':
+      return {
+        type: 'ffmpeg_vp8',
+        bitrate: encoder.bitrate && intoVideoEncoderBitrate(encoder.bitrate),
+        keyframe_interval_ms: encoder.keyframeIntervalMs,
+        ffmpeg_options: encoder.ffmpegOptions,
+      };
+    case 'ffmpeg_vp9':
+      return {
+        type: 'ffmpeg_vp9',
+        bitrate: encoder.bitrate && intoVideoEncoderBitrate(encoder.bitrate),
+        keyframe_interval_ms: encoder.keyframeIntervalMs,
+        pixel_format: encoder.pixelFormat,
+        ffmpeg_options: encoder.ffmpegOptions,
+      };
+    case 'vulkan_h264':
+      return {
+        type: 'vulkan_h264',
+        bitrate: encoder.bitrate && intoVideoEncoderBitrate(encoder.bitrate),
+        keyframe_interval_ms: encoder.keyframeIntervalMs,
+      };
+  }
+}
+
+function intoOutputRtmpClientAudioOptions(
+  audio: Outputs.RtmpClientAudioOptions,
+  initial: Api.AudioScene
+): Api.OutputRtmpClientAudioOptions {
+  return {
+    send_eos_when: audio.sendEosWhen && intoOutputEosCondition(audio.sendEosWhen),
+    channels: audio.channels,
+    encoder: intoRtmpClientAudioEncoderOptions(audio.encoder),
+    initial,
+  };
+}
+
+function intoRtmpClientAudioEncoderOptions(
+  encoder: Outputs.RtmpClientAudioEncoderOptions
+): Api.RtmpClientAudioEncoderOptions {
+  switch (encoder.type) {
+    case 'aac':
+      return {
+        type: 'aac',
+        sample_rate: encoder.sampleRate,
+      };
+    case 'opus':
+      return {
+        type: 'opus',
+        preset: encoder.preset,
+        sample_rate: encoder.sampleRate,
+      };
+  }
+}

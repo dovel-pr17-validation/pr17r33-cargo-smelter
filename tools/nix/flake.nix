@@ -1,0 +1,129 @@
+{
+  description = "Dev shell for Smelter";
+
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # Does not follow our nixpkgs, so the upstream binary cache (kixelated.cachix.org) still
+    # matches.
+    moq.url = "github:moq-dev/moq/f1a828ac8c4fe812e145ef838b554a42a364f306";
+  };
+
+  outputs = inputs@{ flake-parts, ... }:
+    flake-parts.lib.mkFlake { inherit inputs; } {
+      systems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" "x86_64-darwin" ];
+      perSystem = { config, self', inputs', pkgs, system, lib, ... }:
+        let
+          packageWithoutChromium = (pkgs.callPackage ./package.nix { });
+
+          # https://github.com/NixOS/nixpkgs/blob/master/pkgs/development/libraries/libcef/default.nix#L33
+          libcefDependencies = with pkgs;  [
+            glib
+            nss
+            nspr
+            atk
+            at-spi2-atk
+            expat
+            libxcb
+            libxkbcommon
+            libX11
+            libxcomposite
+            libxdamage
+            libxext
+            libxfixes
+            libxrandr
+            mesa
+            gtk3
+            pango
+            cairo
+            dbus
+            at-spi2-core
+            cups
+            libxshmfence
+          ] ++ (
+            pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+              libdrm
+              libgbm
+              udev
+              alsa-lib
+            ]
+          );
+          devDependencies = with pkgs; [
+            ffmpeg_8-full
+            mold
+
+            gst_all_1.gstreamer
+            gst_all_1.gst-plugins-base
+            gst_all_1.gst-plugins-good
+            gst_all_1.gst-plugins-bad
+            gst_all_1.gst-plugins-ugly
+            gst_all_1.gst-libav
+
+            # Node.js
+            nodejs_22
+            pnpm
+            yarn
+
+            # Rust
+            rustfmt
+            clippy
+            cargo-watch
+            cargo-nextest
+            rust-analyzer
+
+            # Python
+            python313
+            uv
+
+            clang-tools
+            llvmPackages.bintools
+            libGL
+            vulkan-loader
+
+            streamlink
+          ] ++ (
+            pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+              wayland
+            ]
+          ) ++ (
+            # Not available on x86_64-darwin
+            pkgs.lib.optionals (inputs'.moq.packages ? moq-relay) [
+              inputs'.moq.packages.moq-relay
+            ]
+          );
+        in
+        {
+          devShells = {
+            default = if pkgs.stdenv.hostPlatform.isLinux then self'.devShells.linux else self'.devShells.macos;
+            linux = pkgs.mkShell {
+              packages = devDependencies ++ [ pkgs.mesa pkgs.blackmagic-desktop-video ];
+
+              # Fixes "ffplay" used in examples on Linux (not needed on NixOS)
+              env.LIBGL_DRIVERS_PATH = "${pkgs.mesa}/lib/dri";
+
+              env.LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+              env.LD_LIBRARY_PATH = lib.makeLibraryPath (libcefDependencies ++ [ pkgs.libGL pkgs.blackmagic-desktop-video pkgs.wayland pkgs.vulkan-loader pkgs.stdenv.cc.cc.lib pkgs.zlib ]);
+
+              inputsFrom = [ packageWithoutChromium ];
+            };
+            macos = pkgs.mkShell {
+              packages = devDependencies;
+              inputsFrom = [ packageWithoutChromium ];
+            };
+            nixos = pkgs.mkShell {
+              packages = devDependencies ++ [ pkgs.mesa pkgs.blackmagic-desktop-video ];
+
+              env.LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+              env.LD_LIBRARY_PATH = lib.makeLibraryPath (libcefDependencies ++ [ pkgs.libGL pkgs.blackmagic-desktop-video pkgs.wayland pkgs.vulkan-loader pkgs.stdenv.cc.cc.lib pkgs.zlib ]);
+
+              inputsFrom = [ packageWithoutChromium ];
+            };
+          };
+          packages = {
+            default = packageWithoutChromium;
+          } // lib.optionalAttrs (inputs'.moq.packages ? moq-relay) {
+            # Not available on x86_64-darwin
+            moq-relay = inputs'.moq.packages.moq-relay;
+          };
+        };
+    };
+}

@@ -1,0 +1,125 @@
+use core::panic;
+use std::{fs::File, io::Write, time::Duration};
+
+use integration_tests::{media::TestSample, paths::integration_tests_root};
+use smelter::{config::read_config, logger, state::ApiState};
+use smelter_core::{codecs::*, protocols::*, *};
+use smelter_render::{
+    InputId, OutputId, Resolution,
+    error::ErrorStack,
+    scene::{Component, InputStreamComponent},
+};
+
+// Start simple pipeline with output that sends encoded video/audio via Rust channel.
+//
+// Data read from channels are dumped into files as it is without any timestamp data.
+fn main() {
+    ffmpeg_next::format::network::init();
+    let mut config = read_config();
+    logger::init_logger(config.logger.clone());
+    let root_dir = integration_tests_root();
+    config.ahead_of_time_processing = true;
+    // no chromium support, so we can ignore _event_loop
+    let state = ApiState::new(config).unwrap_or_else(|err| {
+        panic!(
+            "Failed to start compositor.\n{}",
+            ErrorStack::new(&err).into_string()
+        )
+    });
+    let output_id = OutputId("output_1".into());
+    let input_id = InputId("input_id".into());
+
+    let output_options = RegisterEncodedDataOutputOptions {
+        output_options: EncodedDataOutputOptions {
+            video: Some(VideoEncoderOptions::FfmpegH264(FfmpegH264EncoderOptions {
+                encoder_name: None,
+                bitrate: None,
+                keyframe_interval: Duration::from_millis(5000),
+                resolution: Resolution {
+                    width: 1280,
+                    height: 720,
+                },
+                pixel_format: OutputPixelFormat::YUV420P,
+                raw_options: vec![("preset".into(), "ultrafast".into())],
+                bitstream_format: H264BitstreamFormat::AnnexB,
+                low_latency: false,
+            })),
+            audio: Some(AudioEncoderOptions::Opus(OpusEncoderOptions {
+                channels: AudioChannels::Stereo,
+                preset: OpusEncoderPreset::Voip,
+                sample_rate: 48000,
+                forward_error_correction: false,
+                packet_loss: 0,
+            })),
+        },
+        video: Some(RegisterOutputVideoOptions {
+            initial: Component::InputStream(InputStreamComponent {
+                id: None,
+                input_id: input_id.clone(),
+            }),
+            end_condition: PipelineOutputEndCondition::Never,
+        }),
+        audio: Some(RegisterOutputAudioOptions {
+            initial: AudioMixerConfig {
+                inputs: vec![AudioMixerInputConfig {
+                    input_id: input_id.clone(),
+                    volume: 1.0,
+                }],
+            },
+            mixing_strategy: AudioMixingStrategy::SumClip,
+            channels: AudioChannels::Stereo,
+            end_condition: PipelineOutputEndCondition::Never,
+        }),
+    };
+
+    let input_options = RegisterInputOptions::Mp4(Mp4InputOptions {
+        source: Mp4InputSource::File(
+            TestSample::BigBuckBunnyH264AAC
+                .ensure_path()
+                .unwrap()
+                .into(),
+        ),
+        should_loop: false,
+        video_decoders: Mp4InputVideoDecoders {
+            h264: Some(VideoDecoderOptions::FfmpegH264),
+        },
+        seek: None,
+        offset: Some(Duration::ZERO),
+        queue_options: QueueInputOptions {
+            required: true,
+            ..Default::default()
+        },
+    });
+
+    Pipeline::register_input(&state.pipeline().unwrap(), input_id.clone(), input_options).unwrap();
+
+    let output = Pipeline::register_encoded_data_output(
+        &state.pipeline().unwrap(),
+        output_id.clone(),
+        output_options,
+    )
+    .unwrap();
+
+    Pipeline::start(&state.pipeline().unwrap());
+
+    let mut h264_dump =
+        File::create(root_dir.join("examples/encoded_channel_output_dump.h264")).unwrap();
+    let mut opus_dump =
+        File::create(root_dir.join("examples/encoded_channel_output_dump.opus")).unwrap();
+
+    for (index, chunk) in output.receiver.iter().enumerate() {
+        if index > 3000 {
+            return;
+        }
+        let EncodedOutputEvent::Data(chunk) = chunk else {
+            return;
+        };
+        match chunk.kind {
+            MediaKind::Video(VideoCodec::H264) => h264_dump.write_all(&chunk.data).unwrap(),
+            MediaKind::Video(VideoCodec::Vp8) => unreachable!(),
+            MediaKind::Video(VideoCodec::Vp9) => unreachable!(),
+            MediaKind::Audio(AudioCodec::Opus) => opus_dump.write_all(&chunk.data).unwrap(),
+            MediaKind::Audio(AudioCodec::Aac) => panic!("AAC is not supported on output"),
+        }
+    }
+}

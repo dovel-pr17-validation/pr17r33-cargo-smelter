@@ -1,0 +1,39 @@
+import { _smelterInternals } from '@swmansion/smelter';
+import { parseInputRef } from './api/input';
+import type { Logger } from './logger';
+
+export type SmelterEvent = _smelterInternals.SmelterEvent;
+export const SmelterEventType = _smelterInternals.SmelterEventType;
+
+export function parseEvent(event: any, logger: Logger): SmelterEvent | null {
+  if (!event.type) {
+    logger.error(`Malformed event: ${event}`);
+    return null;
+  } else if (
+    [
+      SmelterEventType.VIDEO_INPUT_DELIVERED,
+      SmelterEventType.AUDIO_INPUT_DELIVERED,
+      SmelterEventType.VIDEO_INPUT_PLAYING,
+      SmelterEventType.AUDIO_INPUT_PLAYING,
+      SmelterEventType.VIDEO_INPUT_PAUSED,
+      SmelterEventType.AUDIO_INPUT_PAUSED,
+      SmelterEventType.VIDEO_INPUT_EOS,
+      SmelterEventType.AUDIO_INPUT_EOS,
+    ].includes(event.type)
+  ) {
+    return { type: event.type, inputRef: parseInputRef(event.input_id) };
+  } else if (SmelterEventType.OUTPUT_DONE === event.type) {
+    return { type: event.type, outputId: event.output_id };
+  } else if (SmelterEventType.OUTPUT_ERROR === event.type) {
+    return {
+      type: event.type,
+      outputId: event.output_id,
+      severity: event.severity,
+      error: event.err,
+      errorStack: event.stack,
+    };
+  } else {
+    logger.error(`Unknown event type: ${event.type}`);
+    return null;
+  }
+}

@@ -1,0 +1,406 @@
+use anyhow::{Result, anyhow};
+use integration_tests::media::{MediaReceiver, ProcessHandle, Receive};
+use serde::{Deserialize, Serialize, ser::SerializeStruct};
+
+use inquire::{Confirm, Select, Text};
+use serde_json::json;
+use strum::{Display, IntoEnumIterator};
+use tracing::error;
+
+use crate::{
+    inputs::{InputHandle, filter_video_inputs},
+    outputs::{AudioEncoder, VideoEncoder, VideoResolution, scene::Scene},
+    players::OutputPlayer,
+};
+
+use crate::utils::get_free_port;
+
+#[derive(Debug, Display, Clone)]
+pub enum RtmpRegisterOptions {
+    #[strum(to_string = "Set video stream")]
+    SetVideoStream,
+
+    #[strum(to_string = "Set audio stream")]
+    SetAudioStream,
+
+    #[strum(to_string = "Skip")]
+    Skip,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(from = "RtmpOutputOptions")]
+pub struct RtmpOutput {
+    pub name: String,
+    port: u16,
+    options: RtmpOutputOptions,
+    stream_handles: Vec<ProcessHandle>,
+}
+
+// URL and name fields of `RtmpOutput` depend on the port field which has to be calculated
+// dynamically to avoid situation in which ports collide. This struct is required to make it
+// possible for name and URL fields to read the port value. JSON is deserialized to this struct and
+// remaining fields are determined during conversion
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RtmpOutputOptions {
+    url: String,
+    video: Option<RtmpOutputVideoOptions>,
+    audio: Option<RtmpOutputAudioOptions>,
+    player: OutputPlayer,
+}
+
+impl Serialize for RtmpOutput {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = serializer.serialize_struct("RtmpOutput", 4)?;
+        state.serialize_field("video", &self.options.video)?;
+        state.serialize_field("audio", &self.options.audio)?;
+        state.serialize_field("player", &self.options.player)?;
+        state.serialize_field("url", &self.options.url)?;
+        state.end()
+    }
+}
+
+impl From<RtmpOutputOptions> for RtmpOutput {
+    fn from(mut value: RtmpOutputOptions) -> Self {
+        let port = get_free_port();
+        let name = format!("output_rtmp_{port}");
+        if value.url.starts_with("rtmp://localhost") || value.url.starts_with("rtmp://127.") {
+            value.url = format!("rtmp://127.0.0.1:{port}");
+        }
+        Self {
+            name,
+            port,
+            options: value,
+            stream_handles: vec![],
+        }
+    }
+}
+
+impl RtmpOutput {
+    pub fn serialize_register(&self, inputs: &[InputHandle]) -> serde_json::Value {
+        json!({
+            "type": "rtmp_client",
+            "url": self.options.url,
+            "video": self.options.video.as_ref().map(|v| v.serialize_register(inputs)),
+            "audio": self.options.audio.as_ref().map(|a| a.serialize_register(inputs)),
+        })
+    }
+
+    pub fn serialize_update(&self, inputs: &[InputHandle]) -> serde_json::Value {
+        json!({
+            "video": self.options.video.as_ref().map(|v| v.serialize_update(inputs)),
+            "audio": self.options.audio.as_ref().map(|a| a.serialize_update(inputs)),
+        })
+    }
+
+    pub fn on_before_registration(&mut self) -> Result<()> {
+        match self.options.player {
+            OutputPlayer::Ffmpeg => self.start_ffmpeg_recv(),
+            OutputPlayer::External => Ok(()),
+            OutputPlayer::Manual => {
+                let cmd = format!(
+                    "ffmpeg -f flv -listen 1 -i 'rtmp://0.0.0.0:{}' -vcodec copy -f flv - | ffplay -autoexit -f flv -i -",
+                    self.port
+                );
+
+                println!("Start FFmpeg player: {cmd}");
+
+                loop {
+                    let confirmation = Confirm::new("Is player running? [Y/n]")
+                        .with_default(true)
+                        .prompt()?;
+                    if confirmation {
+                        return Ok(());
+                    }
+                }
+            }
+            _ => Err(anyhow!("Invalid player for RTMP output!")),
+        }
+    }
+
+    fn start_ffmpeg_recv(&mut self) -> Result<()> {
+        let handles = MediaReceiver::new(Receive::rtmp_listener(self.port)).spawn()?;
+        self.stream_handles.extend(handles);
+        Ok(())
+    }
+}
+
+impl Drop for RtmpOutput {
+    fn drop(&mut self) {
+        for stream_process in self.stream_handles.drain(..) {
+            stream_process.kill();
+        }
+    }
+}
+
+pub struct RtmpOutputBuilder {
+    name: String,
+    url: Option<String>,
+    port: u16,
+    video: Option<RtmpOutputVideoOptions>,
+    audio: Option<RtmpOutputAudioOptions>,
+    player: OutputPlayer,
+}
+
+impl RtmpOutputBuilder {
+    pub fn new() -> Self {
+        let port = get_free_port();
+        let name = format!("output_rtmp_{port}");
+        Self {
+            name,
+            url: None,
+            port,
+            video: None,
+            audio: None,
+            player: OutputPlayer::Manual,
+        }
+    }
+
+    pub fn prompt(self) -> Result<Self> {
+        let mut builder = self;
+        builder = builder.prompt_url()?;
+
+        loop {
+            builder = builder.prompt_video()?.prompt_audio()?;
+
+            if builder.video.is_none() && builder.audio.is_none() {
+                error!("Either audio or video has to be specified.");
+            } else {
+                break;
+            }
+        }
+
+        match &builder.url {
+            Some(_) => Ok(builder),
+            None => builder.prompt_player(),
+        }
+    }
+
+    fn prompt_url(self) -> Result<Self> {
+        let url_input =
+            Text::new("Enter streaming URL (ESC for local FFmpeg server):").prompt_skippable()?;
+        match url_input {
+            Some(url) if !url.trim().is_empty() => {
+                Ok(self.with_player(OutputPlayer::External).with_url(url))
+            }
+            Some(_) | None => Ok(self),
+        }
+    }
+
+    fn prompt_video(self) -> Result<Self> {
+        let video_options = vec![
+            RtmpRegisterOptions::SetVideoStream,
+            RtmpRegisterOptions::Skip,
+        ];
+        let video_selection = Select::new("Set video stream?", video_options).prompt_skippable()?;
+
+        match video_selection {
+            Some(RtmpRegisterOptions::SetVideoStream) => {
+                let mut video = RtmpOutputVideoOptions::default();
+                let scene_options = Scene::iter().collect();
+                let scene_choice =
+                    Select::new("Select scene:", scene_options).prompt_skippable()?;
+                if let Some(scene) = scene_choice {
+                    video.scene = scene;
+                }
+
+                let encoder_options = vec![
+                    VideoEncoder::FfmpegH264,
+                    VideoEncoder::FfmpegH264LowLatency,
+                    VideoEncoder::VulkanH264,
+                    VideoEncoder::FfmpegVp8,
+                    VideoEncoder::FfmpegVp9,
+                ];
+
+                let encoder_choice =
+                    Select::new("Select encoder (ESC for ffmpeg_h264)", encoder_options)
+                        .prompt_skippable()?;
+                if let Some(encoder) = encoder_choice {
+                    video.encoder = encoder;
+                }
+                Ok(self.with_video(video))
+            }
+            Some(RtmpRegisterOptions::Skip) | None => Ok(self),
+            _ => unreachable!(),
+        }
+    }
+
+    fn prompt_audio(self) -> Result<Self> {
+        let audio_options = vec![
+            RtmpRegisterOptions::SetAudioStream,
+            RtmpRegisterOptions::Skip,
+        ];
+
+        let audio_selection =
+            Select::new("Set audio stream?", audio_options.clone()).prompt_skippable()?;
+
+        match audio_selection {
+            Some(RtmpRegisterOptions::SetAudioStream) => {
+                let mut audio = RtmpOutputAudioOptions::default();
+                let encoder_options = vec![AudioEncoder::Aac, AudioEncoder::Opus];
+                let encoder_choice = Select::new("Select encoder (ESC for aac)", encoder_options)
+                    .prompt_skippable()?;
+                if let Some(encoder) = encoder_choice {
+                    audio.encoder = encoder;
+                }
+
+                Ok(self.with_audio(audio))
+            }
+            Some(RtmpRegisterOptions::Skip) | None => Ok(self),
+            _ => unreachable!(),
+        }
+    }
+
+    fn prompt_player(self) -> Result<Self> {
+        let player_options = vec![OutputPlayer::Ffmpeg, OutputPlayer::Manual];
+        let player_choice =
+            Select::new("Select player (ESC for FFmpeg):", player_options).prompt_skippable()?;
+        match player_choice {
+            Some(player) => Ok(self.with_player(player)),
+            None => Ok(self),
+        }
+    }
+
+    pub fn with_url(mut self, url: String) -> Self {
+        self.url = Some(url);
+        self
+    }
+
+    pub fn with_video(mut self, video: RtmpOutputVideoOptions) -> Self {
+        self.video = Some(video);
+        self
+    }
+
+    pub fn with_audio(mut self, audio: RtmpOutputAudioOptions) -> Self {
+        self.audio = Some(audio);
+        self
+    }
+
+    pub fn with_player(mut self, player: OutputPlayer) -> Self {
+        self.player = player;
+        self
+    }
+
+    pub fn build(self) -> RtmpOutput {
+        let stream_url = self
+            .url
+            .unwrap_or(format!("rtmp://127.0.0.1:{}", self.port));
+        let options = RtmpOutputOptions {
+            video: self.video,
+            audio: self.audio,
+            player: self.player,
+            url: stream_url,
+        };
+        RtmpOutput {
+            name: self.name,
+            port: self.port,
+            options,
+            stream_handles: vec![],
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RtmpOutputVideoOptions {
+    root_id: String,
+    resolution: VideoResolution,
+    encoder: VideoEncoder,
+    scene: Scene,
+}
+
+impl RtmpOutputVideoOptions {
+    pub fn serialize_register(&self, inputs: &[InputHandle]) -> serde_json::Value {
+        let inputs = filter_video_inputs(inputs);
+        json!({
+            "resolution": self.resolution.serialize(),
+            "encoder": self.encoder.serialize(),
+            "initial": {
+                "root": self.scene.serialize(&self.root_id, &inputs, self.resolution),
+            },
+        })
+    }
+
+    pub fn serialize_update(&self, inputs: &[InputHandle]) -> serde_json::Value {
+        let inputs = filter_video_inputs(inputs);
+
+        json!({
+            "root": self.scene.serialize(&self.root_id, &inputs, self.resolution),
+        })
+    }
+}
+
+impl Default for RtmpOutputVideoOptions {
+    fn default() -> Self {
+        let resolution = VideoResolution {
+            width: 1920,
+            height: 1080,
+        };
+        let root_id = "root".to_string();
+        Self {
+            root_id,
+            resolution,
+            encoder: VideoEncoder::FfmpegH264,
+            scene: Scene::Tiles,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RtmpOutputAudioOptions {
+    encoder: AudioEncoder,
+}
+
+impl RtmpOutputAudioOptions {
+    pub fn serialize_register(&self, inputs: &[InputHandle]) -> serde_json::Value {
+        let input_json = inputs
+            .iter()
+            .filter_map(|input| {
+                if input.has_audio() {
+                    Some(json!({
+                        "input_id": input.name(),
+                    }))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        json!({
+            "encoder": {
+                "type": self.encoder.to_string(),
+            },
+            "initial": {
+                "inputs": input_json,
+            }
+        })
+    }
+
+    pub fn serialize_update(&self, inputs: &[InputHandle]) -> serde_json::Value {
+        let input_json = inputs
+            .iter()
+            .filter_map(|input| {
+                if input.has_audio() {
+                    Some(json!({
+                        "input_id": input.name(),
+                    }))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        json!({
+            "inputs": input_json,
+        })
+    }
+}
+
+impl Default for RtmpOutputAudioOptions {
+    fn default() -> Self {
+        Self {
+            encoder: AudioEncoder::Aac,
+        }
+    }
+}

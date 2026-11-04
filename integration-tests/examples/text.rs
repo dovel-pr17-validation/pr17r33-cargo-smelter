@@ -1,0 +1,59 @@
+use anyhow::Result;
+use serde_json::json;
+use smelter_api::Resolution;
+
+use integration_tests::{
+    examples::{self, run_example},
+    media::{MediaReceiver, Receive},
+};
+
+const VIDEO_RESOLUTION: Resolution = Resolution {
+    width: 1920,
+    height: 1080,
+};
+
+const OUTPUT_PORT: u16 = 8002;
+
+fn main() {
+    run_example(client_code);
+}
+
+fn client_code() -> Result<()> {
+    MediaReceiver::new(Receive::rtmp_listener(OUTPUT_PORT)).spawn()?;
+
+    examples::post(
+        "output/output_1/register",
+        &json!({
+            "type": "rtmp_client",
+            "url": format!("rtmp://127.0.0.1:{OUTPUT_PORT}"),
+            "video": {
+                "resolution": {
+                    "width": VIDEO_RESOLUTION.width,
+                    "height": VIDEO_RESOLUTION.height,
+                },
+                "encoder": {
+                    "type": "ffmpeg_h264",
+                    "ffmpeg_options": { "preset": "ultrafast" }
+                },
+                "initial": {
+                    "root": {
+                        "type": "text",
+                        "text": "VideoCompositor🚀\nSecond Line\nLorem ipsum dolor sit amet consectetur adipisicing elit. Soluta delectus optio fugit maiores eaque ab totam, veritatis aperiam provident, aliquam consectetur deserunt cumque est? Saepe tenetur impedit culpa asperiores id?",
+                        "font_size": 100.0,
+                        "font_family": "Comic Sans MS",
+                        "align": "center",
+                        "wrap": "word",
+                        "background_color": "#00800000",
+                        "weight": "bold",
+                        "width": VIDEO_RESOLUTION.width,
+                        "height": VIDEO_RESOLUTION.height,
+                    }
+                }
+            }
+        }),
+    )?;
+
+    examples::post("start", &json!({}))?;
+
+    Ok(())
+}

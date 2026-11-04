@@ -1,0 +1,464 @@
+use std::{fs, path::PathBuf, sync::Arc};
+
+use crossbeam_channel::{Receiver, Sender, bounded};
+use ffmpeg_next::{self as ffmpeg, Rational, Rescale};
+use smelter_render::OutputId;
+use tracing::{debug, error, warn};
+
+use crate::{
+    event::Event,
+    pipeline::{
+        encoder::{
+            encoder_thread_audio::{
+                AudioEncoderThread, AudioEncoderThreadHandle, AudioEncoderThreadOptions,
+            },
+            encoder_thread_video::{
+                VideoEncoderThread, VideoEncoderThreadHandle, VideoEncoderThreadOptions,
+            },
+            fdk_aac::FdkAacEncoder,
+            ffmpeg_h264::FfmpegH264Encoder,
+            vulkan_h264::VulkanH264Encoder,
+        },
+        ffmpeg_utils::{
+            EosState, FfmpegOptions, StreamMutExt, TimestampOffset, warn_unused_options,
+            write_extradata,
+        },
+        output::{Output, OutputAudio, OutputVideo},
+    },
+    utils::InitializableThread,
+};
+
+use crate::prelude::*;
+
+#[derive(Debug, Clone)]
+struct StreamState {
+    index: usize,
+    // Duration of single tick in seconds
+    time_base: Rational,
+    // Duration of single packet/frame in seconds
+    packet_duration: Rational,
+}
+
+pub struct Mp4Output {
+    video: Option<VideoEncoderThreadHandle>,
+    audio: Option<AudioEncoderThreadHandle>,
+}
+
+impl Mp4Output {
+    pub fn new(
+        ctx: Arc<PipelineCtx>,
+        output_ref: Ref<OutputId>,
+        options: Mp4OutputOptions,
+    ) -> Result<Self, OutputInitError> {
+        if options.output_path.exists() {
+            let mut old_index = 0;
+            let mut new_path_for_old_file;
+            loop {
+                new_path_for_old_file = PathBuf::from(format!(
+                    "{}.old.{}",
+                    options.output_path.to_string_lossy(),
+                    old_index
+                ));
+                if !new_path_for_old_file.exists() {
+                    break;
+                }
+                old_index += 1;
+            }
+
+            warn!(
+                "Output file {} already exists. Renaming to {}.",
+                options.output_path.to_string_lossy(),
+                new_path_for_old_file.to_string_lossy()
+            );
+            if let Err(err) = fs::rename(options.output_path.clone(), new_path_for_old_file) {
+                error!("Failed to rename existing output file. Error: {}", err);
+            };
+        }
+
+        let start_at = options.start_at;
+        let (encoded_chunks_sender, encoded_chunks_receiver) = bounded(1);
+        let mut output_ctx = ffmpeg::format::output_as(&options.output_path, "mp4")
+            .map_err(OutputInitError::FfmpegError)?;
+
+        let video = match options.video {
+            Some(video) => Some(Self::init_video_track(
+                &ctx,
+                &output_ref,
+                video,
+                &mut output_ctx,
+                encoded_chunks_sender.clone(),
+            )?),
+            None => None,
+        };
+        let audio = match options.audio {
+            Some(audio) => Some(Self::init_audio_track(
+                &ctx,
+                &output_ref,
+                audio,
+                &mut output_ctx,
+                encoded_chunks_sender.clone(),
+            )?),
+            None => None,
+        };
+
+        let mut ffmpeg_options = FfmpegOptions::from(&[("movflags", "faststart")]);
+        ffmpeg_options.append(&options.raw_options);
+
+        warn_unused_options(
+            &output_ctx
+                .write_header_with(ffmpeg_options.into_dictionary())
+                .map_err(OutputInitError::FfmpegError)?,
+            "MP4 muxer",
+        );
+
+        let (video_encoder, video_stream) = match video {
+            Some((encoder, index, packet_duration)) => (
+                Some(encoder),
+                Some(StreamState {
+                    index,
+                    time_base: output_ctx.stream(index).unwrap().time_base(),
+                    packet_duration,
+                }),
+            ),
+            None => (None, None),
+        };
+
+        let (audio_encoder, audio_stream) = match audio {
+            Some((encoder, index, packet_duration)) => (
+                Some(encoder),
+                Some(StreamState {
+                    index,
+                    time_base: output_ctx.stream(index).unwrap().time_base(),
+                    packet_duration,
+                }),
+            ),
+            None => (None, None),
+        };
+
+        let offset = TimestampOffset::new(
+            ctx.queue_ctx.clone(),
+            start_at,
+            video_stream.is_some(),
+            audio_stream.is_some(),
+            audio_encoder
+                .as_ref()
+                .and_then(|encoder| encoder.config.initial_padding),
+        );
+
+        std::thread::Builder::new()
+            .name(format!("MP4 writer thread for output {output_ref}"))
+            .spawn(move || {
+                let _span =
+                    tracing::info_span!("MP4 writer", output_id = output_ref.to_string()).entered();
+
+                run_ffmpeg_output_thread(
+                    &ctx,
+                    &output_ref,
+                    output_ctx,
+                    video_stream,
+                    audio_stream,
+                    encoded_chunks_receiver,
+                    offset,
+                );
+                ctx.event_emitter
+                    .emit(Event::OutputDone(output_ref.id().clone()));
+                debug!("Closing MP4 writer thread.");
+            })
+            .unwrap();
+
+        Ok(Mp4Output {
+            video: video_encoder,
+            audio: audio_encoder,
+        })
+    }
+
+    fn init_video_track(
+        ctx: &Arc<PipelineCtx>,
+        output_ref: &Ref<OutputId>,
+        options: VideoEncoderOptions,
+        output_ctx: &mut ffmpeg::format::context::Output,
+        encoded_chunks_sender: Sender<EncodedOutputEvent>,
+    ) -> Result<(VideoEncoderThreadHandle, usize, Rational), OutputInitError> {
+        let resolution = options.resolution();
+
+        let encoder = match &options {
+            VideoEncoderOptions::FfmpegH264(options) => {
+                VideoEncoderThread::<FfmpegH264Encoder>::spawn(
+                    output_ref.clone(),
+                    VideoEncoderThreadOptions {
+                        ctx: ctx.clone(),
+                        encoder_options: options.clone(),
+                        chunks_sender: encoded_chunks_sender,
+                    },
+                )?
+            }
+            VideoEncoderOptions::VulkanH264(options) => {
+                if !ctx.graphics_context.has_vulkan_encoder_support() {
+                    return Err(OutputInitError::EncoderError(
+                        EncoderInitError::VulkanContextRequiredForVulkanEncoder,
+                    ));
+                }
+                VideoEncoderThread::<VulkanH264Encoder>::spawn(
+                    output_ref.clone(),
+                    VideoEncoderThreadOptions {
+                        ctx: ctx.clone(),
+                        encoder_options: options.clone(),
+                        chunks_sender: encoded_chunks_sender,
+                    },
+                )?
+            }
+            VideoEncoderOptions::FfmpegVp8(_) => {
+                return Err(OutputInitError::UnsupportedVideoCodec(VideoCodec::Vp8));
+            }
+            VideoEncoderOptions::FfmpegVp9(_) => {
+                return Err(OutputInitError::UnsupportedVideoCodec(VideoCodec::Vp9));
+            }
+        };
+
+        // Packets are AVCC, without an avcC record movenc would treat them as Annex B.
+        let extradata = encoder
+            .encoder_context()
+            .filter(|extradata| !extradata.is_empty())
+            .ok_or(OutputInitError::MissingH264DecoderConfig)?;
+
+        let mut stream = output_ctx
+            .add_stream(ffmpeg::codec::Id::H264)
+            .map_err(OutputInitError::FfmpegError)?;
+
+        stream.set_time_base(VIDEO_TIME_BASE);
+        stream.update_codecpar(|codecpar| {
+            write_extradata(codecpar, extradata);
+
+            codecpar.codec_id = ffmpeg::codec::Id::H264.into();
+            codecpar.codec_type = ffmpeg::ffi::AVMediaType::AVMEDIA_TYPE_VIDEO;
+            codecpar.width = resolution.width as i32;
+            codecpar.height = resolution.height as i32;
+        });
+
+        let framerate = ctx.output_framerate;
+        let packet_duration = Rational(framerate.den as i32, framerate.num as i32);
+        Ok((encoder, stream.index(), packet_duration))
+    }
+
+    fn init_audio_track(
+        ctx: &Arc<PipelineCtx>,
+        output_ref: &Ref<OutputId>,
+        options: AudioEncoderOptions,
+        output_ctx: &mut ffmpeg::format::context::Output,
+        encoded_chunks_sender: Sender<EncodedOutputEvent>,
+    ) -> Result<(AudioEncoderThreadHandle, usize, Rational), OutputInitError> {
+        let channel_count = match options.channels() {
+            AudioChannels::Mono => 1,
+            AudioChannels::Stereo => 2,
+        };
+        let sample_rate = options.sample_rate();
+
+        let encoder = match options {
+            AudioEncoderOptions::FdkAac(options) => AudioEncoderThread::<FdkAacEncoder>::spawn(
+                output_ref.clone(),
+                AudioEncoderThreadOptions {
+                    ctx: ctx.clone(),
+                    encoder_options: options,
+                    chunks_sender: encoded_chunks_sender,
+                },
+            )?,
+            AudioEncoderOptions::Opus(_) => {
+                return Err(OutputInitError::UnsupportedAudioCodec(AudioCodec::Opus));
+            }
+        };
+
+        let mut stream = output_ctx
+            .add_stream(ffmpeg::codec::Id::AAC)
+            .map_err(OutputInitError::FfmpegError)?;
+
+        stream.update_codecpar(|codecpar| {
+            if let Some(extradata) = encoder.encoder_context() {
+                write_extradata(codecpar, extradata);
+            }
+            codecpar.codec_id = ffmpeg::codec::Id::AAC.into();
+            codecpar.codec_type = ffmpeg::ffi::AVMediaType::AVMEDIA_TYPE_AUDIO;
+            codecpar.sample_rate = sample_rate as i32;
+            codecpar.frame_size = encoder.config.samples_per_frame as i32;
+            codecpar.profile = ffmpeg::ffi::FF_PROFILE_AAC_LOW;
+            // Native mono/stereo layout
+            unsafe {
+                ffmpeg::ffi::av_channel_layout_default(&mut codecpar.ch_layout, channel_count)
+            };
+        });
+
+        let packet_duration = Rational(encoder.config.samples_per_frame as i32, sample_rate as i32);
+        Ok((encoder, stream.index(), packet_duration))
+    }
+}
+
+impl Output for Mp4Output {
+    fn audio(&self) -> Option<OutputAudio<'_>> {
+        self.audio.as_ref().map(|audio| OutputAudio {
+            samples_batch_sender: &audio.sample_batch_sender,
+        })
+    }
+
+    fn video(&self) -> Option<OutputVideo<'_>> {
+        self.video.as_ref().map(|video| OutputVideo {
+            resolution: video.config.resolution,
+            frame_format: video.config.output_format,
+            frame_sender: &video.frame_sender,
+            keyframe_request_sender: &video.keyframe_request_sender,
+        })
+    }
+
+    fn kind(&self) -> OutputProtocolKind {
+        OutputProtocolKind::Mp4
+    }
+}
+
+const VIDEO_TIME_BASE: Rational = Rational(1, 90_000);
+const NS_TIME_BASE: Rational = Rational(1, 1_000_000_000);
+
+fn run_ffmpeg_output_thread(
+    ctx: &Arc<PipelineCtx>,
+    output_ref: &Ref<OutputId>,
+    mut output_ctx: ffmpeg::format::context::Output,
+    mut video_stream: Option<StreamState>,
+    mut audio_stream: Option<StreamState>,
+    packets_receiver: Receiver<EncodedOutputEvent>,
+    mut offset: TimestampOffset,
+) {
+    let mut eos_state = EosState::new(video_stream.is_some(), audio_stream.is_some());
+    let stats_sender = Mp4OutputStatsSender {
+        stats_sender: ctx.stats_sender.clone(),
+        output_ref: output_ref.clone(),
+    };
+
+    for packet in packets_receiver.into_iter().map(Some).chain([None]) {
+        let chunks = match packet {
+            Some(EncodedOutputEvent::Data(chunk)) => offset.resolve(chunk),
+            Some(EncodedOutputEvent::VideoEOS) => {
+                eos_state.on_video_eos();
+                offset.on_track_eos(MediaKind::Video(VideoCodec::H264))
+            }
+            Some(EncodedOutputEvent::AudioEOS) => {
+                eos_state.on_audio_eos();
+                offset.on_track_eos(MediaKind::Audio(AudioCodec::Aac))
+            }
+            None => offset.flush(),
+        };
+
+        for (timestamp_offset, chunk) in chunks {
+            let stream = match chunk.kind {
+                MediaKind::Video(_) => match &mut video_stream {
+                    Some(stream) => stream,
+                    None => {
+                        error!("Received unexpected video chunk.");
+                        continue;
+                    }
+                },
+                MediaKind::Audio(_) => match &mut audio_stream {
+                    Some(stream) => stream,
+                    None => {
+                        error!("Received unexpected audio chunk.");
+                        continue;
+                    }
+                },
+            };
+
+            stats_sender.bytes_sent_event(chunk.data.len(), chunk.kind.into());
+            if let Err(err) = write_chunk(chunk, stream, &mut output_ctx, timestamp_offset) {
+                let try_write_trailer = !matches!(err, OutputMp4RuntimeError::NoSpaceLeftOnDevice);
+                ctx.event_emitter.emit(Event::OutputError {
+                    output_id: output_ref.id().clone(),
+                    err: err.into(),
+                    severity: ErrorSeverity::Critical,
+                });
+                match try_write_trailer {
+                    true => {
+                        eos_state.mark_for_abort();
+                        break;
+                    }
+                    false => return,
+                }
+            }
+        }
+
+        if eos_state.is_complete() {
+            break;
+        }
+    }
+
+    if let Err(err) = output_ctx.write_trailer() {
+        let err = match err {
+            ffmpeg::Error::Other {
+                errno: ffmpeg::error::ENOSPC,
+            } => OutputMp4RuntimeError::NoSpaceLeftOnDevice,
+            err => OutputMp4RuntimeError::TrailerWriteError(err),
+        };
+        ctx.event_emitter.emit(Event::OutputError {
+            output_id: output_ref.id().clone(),
+            err: err.into(),
+            severity: ErrorSeverity::Critical,
+        });
+    };
+}
+
+fn write_chunk(
+    chunk: EncodedOutputChunk,
+    stream: &StreamState,
+    output_ctx: &mut ffmpeg::format::context::Output,
+    timestamp_offset: Timestamp,
+) -> Result<(), OutputMp4RuntimeError> {
+    let pts = chunk.pts - timestamp_offset;
+    let dts = chunk.dts.unwrap_or(chunk.pts) - timestamp_offset;
+
+    let mut packet = ffmpeg::Packet::copy(&chunk.data);
+    packet.set_pts(Some(Rescale::rescale(
+        &pts.as_nanos(),
+        NS_TIME_BASE,
+        stream.time_base,
+    )));
+    packet.set_dts(Some(Rescale::rescale(
+        &dts.as_nanos(),
+        NS_TIME_BASE,
+        stream.time_base,
+    )));
+    // Convert from timeline when single packet is a single tick, to stream time
+    // base timeline. Returns duration of single packet in time_base units.
+    packet.set_duration(Rescale::rescale(
+        &1,
+        stream.packet_duration,
+        stream.time_base,
+    ));
+    packet.set_time_base(stream.time_base);
+    packet.set_stream(stream.index);
+
+    if chunk.is_keyframe {
+        packet.set_flags(ffmpeg::packet::Flags::KEY)
+    }
+
+    // Encoders deliver packets in their own output order (video lags behind audio by the
+    // encoder delay), interleave by dts so the tracks are not far apart in the file.
+    //
+    // After one track's EOS, the interleaver holds the other track's packets until the
+    // buffered dts span exceeds `max_interleave_delta` (10s by default).
+    packet
+        .write_interleaved(output_ctx)
+        .map_err(|err| match err {
+            ffmpeg_next::Error::Other {
+                errno: ffmpeg::error::ENOSPC,
+            } => OutputMp4RuntimeError::NoSpaceLeftOnDevice,
+            err => OutputMp4RuntimeError::PacketWriteError(err),
+        })?;
+    Ok(())
+}
+
+struct Mp4OutputStatsSender {
+    stats_sender: StatsSender,
+    output_ref: Ref<OutputId>,
+}
+
+impl Mp4OutputStatsSender {
+    fn bytes_sent_event(&self, size: usize, track_kind: StatsTrackKind) {
+        self.stats_sender.send(
+            Mp4OutputTrackStatsEvent::BytesSent(size).into_event(&self.output_ref, track_kind),
+        );
+    }
+}

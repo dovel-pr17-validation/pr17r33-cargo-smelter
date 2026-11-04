@@ -1,0 +1,45 @@
+{
+  "name": "@swmansion/smelter",
+  "version": "0.4.0",
+  "author": "Software Mansion <contact@swmansion.com>",
+  "license": "MIT",
+  "description": "Compose your videos and live streams with React",
+  "bugs": {
+    "url": "https://github.com/software-mansion/smelter/issues"
+  },
+  "homepage": "https://smelter.dev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/software-mansion/smelter.git",
+    "directory": "ts/smelter"
+  },
+  "files": [
+    "/esm",
+    "/cjs"
+  ],
+  "type": "module",
+  "main": "cjs/index.js",
+  "exports": {
+    "import": "./esm/index.js",
+    "require": "./cjs/index.js",
+    "types": "./esm/index.d.ts"
+  },
+  "scripts": {
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "watch": "concurrently \"pnpm run watch:esm\" \"pnpm run watch:cjs\"",
+    "watch:esm": "tsc --watch --preserveWatchOutput",
+    "watch:cjs": "tsc --watch --preserveWatchOutput -p ./tsconfig.cjs.json",
+    "build": "pnpm run build:esm && pnpm run build:cjs",
+    "build:esm": "tsc && echo '{\"type\": \"module\"}' > esm/package.json",
+    "build:cjs": "tsc -p ./tsconfig.cjs.json && echo '{\"type\": \"commonjs\"}' > cjs/package.json",
+    "clean": "rimraf esm cjs",
+    "prepublishOnly": "pnpm run clean && pnpm run build"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.3"
+  },
+  "peerDependencies": {
+    "react": "*"
+  }
+}

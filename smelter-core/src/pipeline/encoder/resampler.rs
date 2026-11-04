@@ -1,0 +1,289 @@
+use std::time::Duration;
+
+use audioadapter::{Adapter, AdapterMut};
+use rubato::{FixedSync, Resampler};
+use tracing::{error, info, trace};
+
+use crate::{
+    AudioChannels, AudioSamples, PipelineEvent, Timestamp, pipeline::encoder::MAX_PTS_DEVIATION,
+    prelude::OutputAudioSamples, utils::AudioSamplesBuffer,
+};
+
+pub(crate) struct ResampledForEncoderStream<
+    Source: Iterator<Item = PipelineEvent<OutputAudioSamples>>,
+> {
+    /// `None` when input and output sample rates are equal: batches pass
+    /// through untouched (bit-exact samples and PTS, no tail loss at EOS).
+    resampler: Option<OutputResampler>,
+    source: Source,
+    eos_sent: bool,
+}
+
+impl<Source: Iterator<Item = PipelineEvent<OutputAudioSamples>>> ResampledForEncoderStream<Source> {
+    pub fn new(
+        source: Source,
+        input_sample_rate: u32,
+        output_sample_rate: u32,
+        channels: AudioChannels,
+    ) -> Result<Self, rubato::ResamplerConstructionError> {
+        let resampler = match input_sample_rate == output_sample_rate {
+            true => None,
+            false => Some(OutputResampler::new(
+                input_sample_rate,
+                output_sample_rate,
+                channels,
+            )?),
+        };
+        Ok(Self {
+            resampler,
+            source,
+            eos_sent: false,
+        })
+    }
+}
+
+impl<Source: Iterator<Item = PipelineEvent<OutputAudioSamples>>> Iterator
+    for ResampledForEncoderStream<Source>
+{
+    type Item = Vec<PipelineEvent<OutputAudioSamples>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.source.next() {
+            Some(PipelineEvent::Data(samples)) => match &mut self.resampler {
+                Some(resampler) => {
+                    let resampled = resampler.resample(samples);
+                    Some(resampled.into_iter().map(PipelineEvent::Data).collect())
+                }
+                None => Some(vec![PipelineEvent::Data(samples)]),
+            },
+            Some(PipelineEvent::EOS) | None => match self.eos_sent {
+                true => None,
+                false => {
+                    self.eos_sent = true;
+                    Some(vec![PipelineEvent::EOS])
+                }
+            },
+        }
+    }
+}
+
+// This resampler assumes that:
+// - It will receive continuous streams of data, without any gaps. `maybe_reset_on_discontinuity`
+//   is just a sanity check to make sure we can recover.
+// - It can produce chunks of any size, no downstream components require specific sizes.
+struct OutputResampler {
+    input_sample_rate: u32,
+    output_sample_rate: u32,
+
+    resampler_input_buffer: AudioSamplesBuffer,
+    resampler_output_buffer: ResamplerOutputBuffer,
+    resampler: rubato::Fft<f64>,
+
+    /// Audio mixer guarantees continuity on output, so we only need to keep track
+    /// of produces samples and first pts.
+    first_sample_pts: Option<Timestamp>,
+    samples_produced: u64,
+    /// Input samples (per channel) received since `first_sample_pts`.
+    samples_received: u64,
+}
+
+impl OutputResampler {
+    pub fn new(
+        input_sample_rate: u32,
+        output_sample_rate: u32,
+        channels: AudioChannels,
+    ) -> Result<Self, rubato::ResamplerConstructionError> {
+        info!(
+            ?input_sample_rate,
+            ?output_sample_rate,
+            ?channels,
+            "Create output resampler"
+        );
+        let samples_in_batch = 256;
+
+        let resampler = rubato::Fft::<f64>::new(
+            input_sample_rate as usize,
+            output_sample_rate as usize,
+            samples_in_batch,
+            1,
+            match channels {
+                AudioChannels::Mono => 1,
+                AudioChannels::Stereo => 2,
+            },
+            FixedSync::Output,
+        )?;
+        // resampler delay expressed as time
+        let output_delay = resampler.output_delay();
+
+        let mut resampler_output_buffer = ResamplerOutputBuffer::new(channels, samples_in_batch);
+        resampler_output_buffer.samples_to_drop = output_delay;
+
+        Ok(Self {
+            input_sample_rate,
+            output_sample_rate,
+
+            resampler,
+            resampler_input_buffer: AudioSamplesBuffer::new(channels),
+            resampler_output_buffer,
+
+            first_sample_pts: None,
+            samples_produced: 0,
+            samples_received: 0,
+        })
+    }
+
+    pub fn resample(&mut self, batch: OutputAudioSamples) -> Vec<OutputAudioSamples> {
+        trace!(?batch, "Resampler received a new batch");
+        self.maybe_reset_on_discontinuity(batch.start_pts);
+        let first_sample_pts = *self.first_sample_pts.get_or_insert(batch.start_pts);
+
+        self.samples_received += batch.samples.len() as u64;
+        self.resampler_input_buffer.push_back(batch.samples);
+
+        let mut result = vec![];
+        while let Some(samples) = self.inner_resample() {
+            let start_pts = first_sample_pts
+                + Duration::from_secs_f64(
+                    self.samples_produced as f64 / self.output_sample_rate as f64,
+                );
+            self.samples_produced += samples.len() as u64;
+            result.push(OutputAudioSamples { samples, start_pts })
+        }
+        trace!(?result, "Resampler produced samples");
+        result
+    }
+
+    // Audio mixer should always produce continuous stream, just a sanity check
+    fn maybe_reset_on_discontinuity(&mut self, start_pts: Timestamp) {
+        let Some(first_sample_pts) = self.first_sample_pts else {
+            return;
+        };
+        let expected_pts = first_sample_pts
+            + Duration::from_secs_f64(self.samples_received as f64 / self.input_sample_rate as f64);
+        let diff_pts = start_pts - expected_pts;
+        if diff_pts.abs_duration() <= MAX_PTS_DEVIATION {
+            return;
+        }
+        error!(?diff_pts, "Discontinuity in output resampler input.");
+        self.resampler.reset();
+        self.resampler_input_buffer.clear();
+        self.resampler_output_buffer.samples_to_drop = self.resampler.output_delay();
+        self.first_sample_pts = None;
+        self.samples_produced = 0;
+        self.samples_received = 0;
+    }
+
+    fn inner_resample(&mut self) -> Option<AudioSamples> {
+        if self.resampler.input_frames_next() > self.resampler_input_buffer.frames() {
+            return None;
+        }
+
+        let (consumed_samples, generated_samples) = match self.resampler.process_into_buffer(
+            &self.resampler_input_buffer,
+            &mut self.resampler_output_buffer,
+            None,
+        ) {
+            Ok(result) => result,
+            Err(err) => {
+                error!("Resampling error: {err}");
+                self.resampler_output_buffer.fill_with(&0.0);
+                (0, self.resampler_output_buffer.frames())
+            }
+        };
+
+        self.resampler_input_buffer.drain_samples(consumed_samples);
+        if generated_samples != self.resampler_output_buffer.frames() {
+            error!(
+                expected = self.resampler_output_buffer.frames(),
+                actual = generated_samples,
+                "Resampler generated wrong amount of samples"
+            )
+        }
+
+        Some(self.resampler_output_buffer.get_samples())
+    }
+}
+
+#[derive(Debug)]
+struct ResamplerOutputBuffer {
+    buffer: AudioSamples,
+
+    // resampler introduces delay, this value will be non zero if we know that
+    // next resample will produce samples that can be dropped.
+    samples_to_drop: usize,
+}
+
+impl ResamplerOutputBuffer {
+    fn new(channels: AudioChannels, size: usize) -> Self {
+        Self {
+            buffer: AudioSamples::zeros(channels, size),
+            samples_to_drop: 0,
+        }
+    }
+
+    fn get_samples(&mut self) -> AudioSamples {
+        if self.samples_to_drop == 0 {
+            return self.buffer.clone();
+        }
+        let start = usize::min(self.samples_to_drop, self.buffer.len());
+        self.samples_to_drop -= start;
+        match &self.buffer {
+            AudioSamples::Mono(samples) => AudioSamples::Mono(samples[start..].to_vec()),
+            AudioSamples::Stereo(samples) => AudioSamples::Stereo(samples[start..].to_vec()),
+        }
+    }
+}
+
+impl AdapterMut<'_, f64> for ResamplerOutputBuffer {
+    unsafe fn write_sample_unchecked(&mut self, channel: usize, frame: usize, value: &f64) -> bool {
+        match &mut self.buffer {
+            AudioSamples::Mono(samples) => {
+                if channel != 0 {
+                    error!(?channel, "Wrong channel count");
+                } else {
+                    samples[frame] = *value
+                };
+            }
+            AudioSamples::Stereo(samples) => match channel {
+                0 => samples[frame].0 = *value,
+                1 => samples[frame].1 = *value,
+                _ => {
+                    error!(?channel, "Wrong channel count");
+                }
+            },
+        };
+        false
+    }
+}
+
+impl Adapter<'_, f64> for ResamplerOutputBuffer {
+    unsafe fn read_sample_unchecked(&self, channel: usize, frame: usize) -> f64 {
+        match &self.buffer {
+            AudioSamples::Mono(samples) => {
+                if channel != 0 {
+                    error!(?channel, "Wrong channel count");
+                }
+                samples[frame]
+            }
+            AudioSamples::Stereo(samples) => match channel {
+                0 => samples[frame].0,
+                1 => samples[frame].1,
+                _ => {
+                    error!(?channel, "Wrong channel count");
+                    samples[frame].0
+                }
+            },
+        }
+    }
+
+    fn channels(&self) -> usize {
+        match &self.buffer {
+            AudioSamples::Mono(_) => 1,
+            AudioSamples::Stereo(_) => 2,
+        }
+    }
+
+    fn frames(&self) -> usize {
+        self.buffer.len()
+    }
+}

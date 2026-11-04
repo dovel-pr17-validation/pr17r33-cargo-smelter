@@ -1,0 +1,39 @@
+{
+  "name": "create-smelter-app",
+  "version": "0.4.0",
+  "author": "Software Mansion <contact@swmansion.com>",
+  "license": "MIT",
+  "description": "Generate smelter appllication from template",
+  "bugs": {
+    "url": "https://github.com/software-mansion/smelter/issues"
+  },
+  "homepage": "https://smelter.dev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/software-mansion/smelter.git",
+    "directory": "ts/create-smelter-app"
+  },
+  "files": [
+    "/dist",
+    "/templates"
+  ],
+  "main": "dist/index.js",
+  "scripts": {
+    "lint": "eslint ./src",
+    "typecheck": "tsc --noEmit",
+    "watch": "tsc --watch --preserveWatchOutput",
+    "build": "tsc",
+    "clean": "rimraf dist",
+    "prepublishOnly": "pnpm run clean && pnpm run build"
+  },
+  "bin": {
+    "create-smelter-app": "./dist/index.js"
+  },
+  "dependencies": {
+    "chalk": "^4.1.2",
+    "prompts": "^2.4.2"
+  },
+  "devDependencies": {
+    "@types/prompts": "^2.4.9"
+  }
+}

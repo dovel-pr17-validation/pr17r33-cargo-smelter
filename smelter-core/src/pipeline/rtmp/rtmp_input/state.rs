@@ -1,0 +1,126 @@
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    thread::JoinHandle,
+};
+
+use sha3::{Digest, Sha3_512};
+use tracing::error;
+
+use crate::queue::WeakQueueInput;
+
+use crate::prelude::*;
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RtmpInputsState(Arc<Mutex<HashMap<Ref<InputId>, RtmpInputState>>>);
+
+#[derive(Debug)]
+pub(crate) struct RtmpInputState {
+    pub stream_key: Arc<str>,
+    pub decoders: RtmpServerInputDecoders,
+    pub is_live: bool,
+    pub buffer: LiveInputBufferOptions,
+
+    pub queue_input: WeakQueueInput,
+    pub connection_handle: Option<JoinHandle<()>>,
+}
+
+pub(crate) struct RtmpInputStateOptions {
+    pub stream_key: Arc<str>,
+    pub queue_input: WeakQueueInput,
+    pub decoders: RtmpServerInputDecoders,
+    pub is_live: bool,
+    pub buffer: LiveInputBufferOptions,
+}
+
+impl RtmpInputState {
+    fn new(options: RtmpInputStateOptions) -> Self {
+        Self {
+            stream_key: options.stream_key,
+            decoders: options.decoders,
+            is_live: options.is_live,
+            buffer: options.buffer,
+
+            queue_input: options.queue_input,
+            connection_handle: None,
+        }
+    }
+}
+
+impl RtmpInputsState {
+    pub fn get_mut_with<T, Func: FnOnce(&mut RtmpInputState) -> Result<T, RtmpServerError>>(
+        &self,
+        input_ref: &Ref<InputId>,
+        func: Func,
+    ) -> Result<T, RtmpServerError> {
+        let mut guard = self.0.lock().unwrap();
+        match guard.get_mut(input_ref) {
+            Some(input) => func(input),
+            None => Err(RtmpServerError::InputNotFound(input_ref.id().clone())),
+        }
+    }
+
+    pub(crate) fn add_input(
+        &self,
+        input_ref: &Ref<InputId>,
+        options: RtmpInputStateOptions,
+    ) -> Result<(), RtmpServerError> {
+        let mut guard = self.0.lock().unwrap();
+        if guard.contains_key(input_ref) {
+            return Err(RtmpServerError::InputAlreadyRegistered(
+                input_ref.id().clone(),
+            ));
+        }
+        guard.insert(input_ref.clone(), RtmpInputState::new(options));
+        Ok(())
+    }
+
+    pub(crate) fn remove_input(&self, input_ref: &Ref<InputId>) {
+        let mut guard = self.0.lock().unwrap();
+        if guard.remove(input_ref).is_none() {
+            error!(?input_ref, "Failed to remove input, ID not found");
+        }
+    }
+
+    /// The RTMP `app` is the URL-encoded input id, so decode it and match it
+    /// against the registered input ids.
+    pub(crate) fn find_by_app_stream_key(
+        &self,
+        app: &str,
+        stream_key: &Arc<str>,
+    ) -> Result<Ref<InputId>, RtmpServerError> {
+        let app = match urlencoding::decode(app) {
+            Ok(decoded) => decoded.into_owned(),
+            Err(_) => app.to_string(),
+        };
+
+        let guard = self.0.lock().unwrap();
+        let (input_ref, _) = guard
+            .iter()
+            .find(|(input_ref, input)| {
+                let expected_stream_key_hash = Sha3_512::digest(input.stream_key.as_bytes());
+                let provided_stream_key_hash = Sha3_512::digest(stream_key.as_bytes());
+                input_ref.id().0.as_ref() == app
+                    && expected_stream_key_hash == provided_stream_key_hash
+            })
+            .ok_or_else(|| RtmpServerError::NotRegisteredAppStreamKeyPair {
+                app: app.into(),
+                stream_key: stream_key.clone(),
+            })?;
+        Ok(input_ref.clone())
+    }
+}
+
+impl RtmpInputState {
+    pub fn ensure_no_active_connection(
+        &self,
+        input_ref: &Ref<InputId>,
+    ) -> Result<(), RtmpServerError> {
+        match &self.connection_handle {
+            Some(handle) if !handle.is_finished() => Err(RtmpServerError::ConnectionAlreadyActive(
+                input_ref.id().clone(),
+            )),
+            _ => Ok(()),
+        }
+    }
+}

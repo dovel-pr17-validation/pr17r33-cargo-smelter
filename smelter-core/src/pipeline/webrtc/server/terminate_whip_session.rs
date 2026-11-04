@@ -1,0 +1,33 @@
+use crate::pipeline::webrtc::{WhipWhepServerState, error::WhipWhepServerError};
+use axum::{
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode},
+};
+use std::sync::Arc;
+use tracing::info;
+
+pub async fn handle_terminate_whip_session(
+    Path((input_id, session_id)): Path<(String, String)>,
+    State(state): State<WhipWhepServerState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, WhipWhepServerError> {
+    let input_ref = state.inputs.resolve_input_ref(&input_id)?;
+    let session_id = Arc::from(session_id);
+
+    state.inputs.validate_token(&input_ref, &headers)?;
+    state.inputs.validate_session_id(&input_ref, &session_id)?;
+
+    let session = state
+        .inputs
+        .get_mut_with(&input_ref, |input| Ok(input.session.take()))?;
+
+    match session {
+        Some(_) => {
+            info!("WHIP session {session_id:?} terminated");
+            Ok(StatusCode::OK)
+        }
+        None => Err(WhipWhepServerError::InternalError(format!(
+            "None peer connection for {session_id:?}"
+        ))),
+    }
+}

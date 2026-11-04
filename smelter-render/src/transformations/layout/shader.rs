@@ -1,0 +1,163 @@
+use tracing::error;
+
+use crate::{
+    Resolution,
+    state::node_texture::NodeTextureState,
+    wgpu::{
+        WgpuCtx, WgpuErrorScope,
+        common_pipeline::{self, CreateShaderError, Sampler},
+    },
+};
+
+use super::{RenderLayout, params::ParamsBindGroups};
+
+const LABEL: Option<&str> = Some("layout node");
+
+const SHADER_SOURCE: &str = include_str!("./apply_layouts.wgsl");
+const MAX_LAYOUTS_WGSL_DECLARATION: &str = "const MAX_LAYOUTS_COUNT: u32 = 100;";
+
+#[derive(Debug)]
+pub struct LayoutShader {
+    pipeline: wgpu::RenderPipeline,
+    sampler: Sampler,
+    params_bind_groups: ParamsBindGroups,
+}
+
+impl LayoutShader {
+    pub fn new(wgpu_ctx: &WgpuCtx, max_layouts_count: usize) -> Result<Self, CreateShaderError> {
+        let scope = WgpuErrorScope::push(&wgpu_ctx.device);
+
+        assert!(
+            SHADER_SOURCE.contains(MAX_LAYOUTS_WGSL_DECLARATION),
+            "MAX_LAYOUTS_COUNT declaration not found in apply_layouts.wgsl"
+        );
+        let shader_source = SHADER_SOURCE.replace(
+            MAX_LAYOUTS_WGSL_DECLARATION,
+            &format!("const MAX_LAYOUTS_COUNT: u32 = {max_layouts_count};"),
+        );
+        let shader_module = wgpu_ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("apply_layouts.wgsl"),
+                source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+            });
+        let result = Self::new_pipeline(wgpu_ctx, shader_module, max_layouts_count)?;
+
+        scope.pop()?;
+
+        Ok(result)
+    }
+
+    fn new_pipeline(
+        wgpu_ctx: &WgpuCtx,
+        shader_module: wgpu::ShaderModule,
+        max_layouts_count: usize,
+    ) -> Result<Self, CreateShaderError> {
+        let sampler = Sampler::new(&wgpu_ctx.device);
+        let params_bind_groups = ParamsBindGroups::new(wgpu_ctx, max_layouts_count);
+
+        let pipeline_layout =
+            wgpu_ctx
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: LABEL,
+                    bind_group_layouts: &[
+                        Some(&wgpu_ctx.format.single_texture_layout),
+                        Some(&params_bind_groups.bind_group_1_layout),
+                        Some(&params_bind_groups.bind_group_2_layout),
+                        Some(&sampler.bind_group_layout),
+                    ],
+                    immediate_size: 16,
+                });
+
+        let pipeline = common_pipeline::create_render_pipeline(
+            "Layout node",
+            &wgpu_ctx.device,
+            &pipeline_layout,
+            &shader_module,
+            wgpu_ctx.default_view_format(),
+        );
+
+        Ok(Self {
+            pipeline,
+            sampler,
+            params_bind_groups,
+        })
+    }
+
+    pub fn render(
+        &self,
+        wgpu_ctx: &WgpuCtx,
+        output_resolution: Resolution,
+        layouts: Vec<RenderLayout>,
+        texture_views: &[&wgpu::TextureView],
+        target: &NodeTextureState,
+        encoder: &mut wgpu::CommandEncoder,
+    ) {
+        let layout_infos = self
+            .params_bind_groups
+            .update(wgpu_ctx, output_resolution, layouts);
+
+        if layout_infos.len() != texture_views.len() {
+            error!(
+                "Layout infos len ({:?}) and texture views count ({:?}) mismatch",
+                layout_infos.len(),
+                texture_views.len()
+            );
+        }
+
+        let input_texture_bgs: Vec<wgpu::BindGroup> = texture_views
+            .iter()
+            .map(|view| {
+                wgpu_ctx
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        layout: &wgpu_ctx.format.single_texture_layout,
+                        label: LABEL,
+                        entries: &[wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(view),
+                        }],
+                    })
+            })
+            .collect();
+
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: LABEL,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    view: target.view(),
+                    resolve_target: None,
+                    depth_slice: None,
+                })],
+                // TODO: depth stencil attachments
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            for (index, (texture_bg, layout_info)) in input_texture_bgs
+                .iter()
+                .zip(layout_infos.iter())
+                .take(self.params_bind_groups.max_layouts_count)
+                .enumerate()
+            {
+                render_pass.set_pipeline(&self.pipeline);
+
+                render_pass.set_immediates(0, &layout_info.to_bytes());
+
+                render_pass.set_bind_group(0, texture_bg, &[]);
+                render_pass.set_bind_group(1, &self.params_bind_groups.bind_group_1, &[]);
+                render_pass.set_bind_group(2, &self.params_bind_groups.bind_groups_2[index].0, &[]);
+                render_pass.set_bind_group(3, &self.sampler.bind_group, &[]);
+
+                wgpu_ctx.plane.draw(&mut render_pass);
+            }
+        }
+    }
+}

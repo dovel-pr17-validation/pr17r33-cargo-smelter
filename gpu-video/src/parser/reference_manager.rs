@@ -1,0 +1,1035 @@
+use std::sync::Arc;
+
+use h264_reader::nal::{
+    pps::PicParameterSet,
+    slice::{DecRefPicMarking, MemoryManagementControlOperation, SliceHeader},
+    sps::{Profile, SeqParameterSet},
+};
+
+use crate::{parameters::CorruptedStateHandling, parser::decoder_instructions::DecoderInstruction};
+
+use super::nalu_parser::{Slice, SpsExt};
+
+#[derive(Debug, thiserror::Error)]
+pub enum ReferenceManagementError {
+    #[error("SI frames are not supported")]
+    SIFramesNotSupported,
+
+    #[error("SP frames are not supported")]
+    SPFramesNotSupported,
+
+    #[error("PicOrderCntType {0} is not supperted")]
+    PicOrderCntTypeNotSupported(u8),
+
+    #[error("The H.264 bytestream is not spec compliant: {0}.")]
+    IncorrectData(String),
+
+    /// Corrupted state can be caused by missing frames or invalid bitstream. This error can be only
+    /// cleared by decoding a valid IDR frame.
+    #[error("Decoder is in a corrupted state. Waiting for IDR frame")]
+    CorruptedState,
+
+    #[error("Unknown H.264 level_idc: {0}")]
+    UnknownLevelIdc(u8),
+}
+
+#[derive(Debug, Default, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ReferenceId(usize);
+
+#[derive(Debug, Default)]
+#[allow(non_snake_case)]
+pub(crate) struct ReferenceContext {
+    pictures: ReferencePictures,
+    next_reference_id: ReferenceId,
+    prevFrameNum: u16,
+    PrevRefFrameNum: u16,
+    prev_pic_order_cnt_msb: i32,
+    prev_pic_order_cnt_lsb: i32,
+    MaxLongTermFrameIdx: MaxLongTermFrameIdx,
+    prevFrameNumOffset: i64,
+    previous_picture_included_mmco_equal_5: bool,
+    detected_corrupted_state: bool,
+    corrupted_state_handling: CorruptedStateHandling,
+}
+
+#[derive(Debug, Default)]
+enum MaxLongTermFrameIdx {
+    #[default]
+    NoLongTermFrameIndices,
+    Idx(u64),
+}
+
+/// Table A-1 from the H.264 spec: MaxDpbMbs per level_idc
+fn h264_level_idc_to_max_dpb_mbs(level_idc: u8) -> Result<u64, ReferenceManagementError> {
+    match level_idc {
+        10 => Ok(396),
+        11 => Ok(900),
+        12 => Ok(2_376),
+        13 => Ok(2_376),
+        20 => Ok(2_376),
+        21 => Ok(4_752),
+        22 => Ok(8_100),
+        30 => Ok(8_100),
+        31 => Ok(18_000),
+        32 => Ok(20_480),
+        40 => Ok(32_768),
+        41 => Ok(32_768),
+        42 => Ok(34_816),
+        50 => Ok(110_400),
+        51 => Ok(184_320),
+        52 => Ok(184_320),
+        60 => Ok(696_320),
+        61 => Ok(696_320),
+        62 => Ok(696_320),
+        _ => Err(ReferenceManagementError::UnknownLevelIdc(level_idc)),
+    }
+}
+
+pub(crate) fn calculate_max_num_reorder_frames(
+    sps: &SeqParameterSet,
+) -> Result<u64, ReferenceManagementError> {
+    let fallback = if [44u8, 86, 100, 110, 122, 244].contains(&sps.profile_idc.into())
+        && sps.constraint_flags.flag3()
+    {
+        0
+    } else if let Profile::Baseline = sps.profile() {
+        0
+    } else {
+        h264_level_idc_to_max_dpb_mbs(sps.level_idc)?
+            / ((sps.pic_width_in_mbs_minus1 as u64 + 1)
+                * (sps.pic_height_in_map_units_minus1 as u64 + 1))
+    };
+
+    let max_num_reorder_frames = sps
+        .vui_parameters
+        .as_ref()
+        .and_then(|v| v.bitstream_restrictions.as_ref())
+        .map(|b| b.max_num_reorder_frames as u64)
+        .unwrap_or(fallback)
+        .min(16);
+
+    Ok(max_num_reorder_frames)
+}
+
+impl ReferenceContext {
+    pub fn new(missed_frame_handling: CorruptedStateHandling) -> Self {
+        Self {
+            corrupted_state_handling: missed_frame_handling,
+            ..Default::default()
+        }
+    }
+
+    fn next_reference_id(&mut self) -> ReferenceId {
+        let result = self.next_reference_id;
+        self.next_reference_id = ReferenceId(result.0 + 1);
+        result
+    }
+
+    fn reset_state(&mut self) {
+        *self = Self {
+            pictures: ReferencePictures::default(),
+            next_reference_id: ReferenceId::default(),
+            prevFrameNum: 0,
+            PrevRefFrameNum: 0,
+            prev_pic_order_cnt_msb: 0,
+            prev_pic_order_cnt_lsb: 0,
+            MaxLongTermFrameIdx: MaxLongTermFrameIdx::NoLongTermFrameIndices,
+            prevFrameNumOffset: 0,
+            previous_picture_included_mmco_equal_5: false,
+            detected_corrupted_state: false,
+            corrupted_state_handling: self.corrupted_state_handling,
+        };
+    }
+
+    #[allow(non_snake_case)]
+    fn add_long_term_reference(
+        &mut self,
+        frame_num: u16,
+        LongTermFrameIdx: u64,
+        pic_order_cnt: [i32; 2],
+    ) -> ReferenceId {
+        let id = self.next_reference_id();
+        self.pictures.long_term.push(LongTermReferencePicture {
+            frame_num,
+            id,
+            LongTermFrameIdx,
+            pic_order_cnt,
+        });
+
+        id
+    }
+
+    fn add_short_term_reference(&mut self, frame_num: u16, pic_order_cnt: [i32; 2]) -> ReferenceId {
+        let id = self.next_reference_id();
+        self.pictures.short_term.push(ShortTermReferencePicture {
+            frame_num,
+            id,
+            pic_order_cnt,
+            non_existing: false,
+        });
+        id
+    }
+
+    fn add_non_existing_short_term_reference(
+        &mut self,
+        frame_num: u16,
+        pic_order_cnt: [i32; 2],
+    ) -> ReferenceId {
+        let id = self.next_reference_id();
+        self.pictures.short_term.push(ShortTermReferencePicture {
+            frame_num,
+            id,
+            pic_order_cnt,
+            non_existing: true,
+        });
+        id
+    }
+
+    pub(crate) fn mark_corrupted_state(&mut self) {
+        self.detected_corrupted_state = true;
+    }
+
+    pub(crate) fn put_picture(
+        &mut self,
+        mut slices: Vec<(Slice, Option<u64>)>,
+    ) -> Result<Vec<DecoderInstruction>, ReferenceManagementError> {
+        let header = slices.last().unwrap().0.header.clone();
+        let sps = slices.last().unwrap().0.sps.clone();
+        let pps = slices.last().unwrap().0.pps.clone();
+        let pts = slices.last().unwrap().1;
+
+        let is_ref_frame = header.dec_ref_pic_marking.is_some();
+        let is_idr = matches!(
+            &header.dec_ref_pic_marking,
+            Some(DecRefPicMarking::Idr { .. })
+        );
+        if is_ref_frame
+            && !is_idr
+            && self.corrupted_state_handling == CorruptedStateHandling::Strict
+        {
+            self.verify_frame_num(&sps, &header)?;
+        }
+
+        let has_gap = header.frame_num != self.PrevRefFrameNum
+            && header.frame_num
+                != ((self.PrevRefFrameNum as u32 + 1) % sps.max_frame_num() as u32) as u16;
+
+        let gap_instructions = if sps.gaps_in_frame_num_value_allowed_flag && !is_idr && has_gap {
+            self.handle_gaps_in_frame_num(&sps, header.frame_num)?
+        } else {
+            Vec::new()
+        };
+
+        // maybe this should be done in a different place, but if you think about it, there's not
+        // really that many places to put this code in
+        let mut rbsp_bytes = Vec::new();
+        let mut slice_indices = Vec::new();
+        for (slice, _) in &mut slices {
+            if slice.rbsp_bytes.is_empty() {
+                continue;
+            }
+            slice_indices.push(rbsp_bytes.len());
+            rbsp_bytes.append(&mut slice.rbsp_bytes);
+        }
+
+        let decode_info = self.decode_information_for_frame(
+            header.clone(),
+            slice_indices,
+            rbsp_bytes,
+            &sps,
+            &pps,
+            pts,
+        )?;
+
+        let decoder_instructions = match &header.clone().dec_ref_pic_marking {
+            Some(DecRefPicMarking::Idr {
+                long_term_reference_flag,
+                ..
+            }) => self.reference_picture_marking_process_idr(
+                header.clone(),
+                decode_info,
+                *long_term_reference_flag,
+            )?,
+
+            Some(DecRefPicMarking::SlidingWindow) => self
+                .reference_picture_marking_process_sliding_window(
+                    &sps,
+                    header.clone(),
+                    decode_info,
+                )?,
+            Some(DecRefPicMarking::Adaptive(memory_management_control_operations)) => self
+                .reference_picture_marking_process_adaptive(
+                    &sps,
+                    header.clone(),
+                    decode_info,
+                    memory_management_control_operations,
+                )?,
+
+            // this picture is not a reference
+            None => {
+                let reference_id = self.next_reference_id();
+                vec![
+                    DecoderInstruction::Decode {
+                        decode_info,
+                        reference_id,
+                    },
+                    DecoderInstruction::Drop {
+                        reference_ids: vec![reference_id],
+                    },
+                ]
+            }
+        };
+
+        self.previous_picture_included_mmco_equal_5 = header.includes_mmco_equal_5();
+        self.prevFrameNum = header.frame_num;
+        if is_ref_frame {
+            self.PrevRefFrameNum = header.frame_num;
+        }
+
+        let mut instructions = Vec::new();
+        instructions.extend(gap_instructions);
+        instructions.extend(decoder_instructions);
+
+        Ok(instructions)
+    }
+
+    fn remove_long_term_ref(
+        &mut self,
+        long_term_frame_idx: u64,
+    ) -> Result<LongTermReferencePicture, ReferenceManagementError> {
+        for (i, frame) in self.pictures.long_term.iter().enumerate() {
+            if frame.LongTermFrameIdx == long_term_frame_idx {
+                return Ok(self.pictures.long_term.remove(i));
+            }
+        }
+
+        Err(ReferenceManagementError::IncorrectData(format!(
+            "cannot remove long term reference with id {long_term_frame_idx}, because it does not exist"
+        )))
+    }
+
+    #[allow(non_snake_case)]
+    fn remove_short_term_ref(
+        &mut self,
+        current_frame_num: i64,
+        sps: &SeqParameterSet,
+        pic_num_to_remove: i64,
+    ) -> Result<ShortTermReferencePicture, ReferenceManagementError> {
+        for (i, picture) in self.pictures.short_term.iter().enumerate() {
+            let PicNum = decode_picture_numbers_for_short_term_ref(
+                picture.frame_num.into(),
+                current_frame_num,
+                sps,
+            )
+            .PicNum;
+
+            if PicNum == pic_num_to_remove {
+                return Ok(self.pictures.short_term.remove(i));
+            }
+        }
+
+        Err(ReferenceManagementError::IncorrectData(format!(
+            "cannot remove short term reference with pic num {pic_num_to_remove}, because it does not exist"
+        )))
+    }
+
+    fn reference_picture_marking_process_adaptive(
+        &mut self,
+        sps: &SeqParameterSet,
+        header: Arc<SliceHeader>,
+        decode_info: DecodeInformation,
+        memory_management_control_operations: &[MemoryManagementControlOperation],
+    ) -> Result<Vec<DecoderInstruction>, ReferenceManagementError> {
+        let mut decoder_instructions = Vec::new();
+
+        let mut new_long_term_frame_idx = None;
+
+        for memory_management_control_operation in memory_management_control_operations {
+            match memory_management_control_operation {
+                MemoryManagementControlOperation::ShortTermUnusedForRef {
+                    difference_of_pic_nums_minus1,
+                } => {
+                    let pic_num_to_remove =
+                        header.frame_num as i64 - (*difference_of_pic_nums_minus1 as i64 + 1);
+
+                    let removed = self.remove_short_term_ref(
+                        header.frame_num.into(),
+                        sps,
+                        pic_num_to_remove,
+                    )?;
+
+                    if !removed.non_existing {
+                        decoder_instructions.push(DecoderInstruction::Drop {
+                            reference_ids: vec![removed.id],
+                        });
+                    }
+                }
+
+                MemoryManagementControlOperation::LongTermUnusedForRef { long_term_pic_num } => {
+                    let removed = self.remove_long_term_ref(*long_term_pic_num as u64)?;
+
+                    decoder_instructions.push(DecoderInstruction::Drop {
+                        reference_ids: vec![removed.id],
+                    });
+                }
+
+                MemoryManagementControlOperation::ShortTermUsedForLongTerm {
+                    difference_of_pic_nums_minus1,
+                    long_term_frame_idx,
+                } => {
+                    if let Ok(removed) = self.remove_long_term_ref(*long_term_frame_idx as u64) {
+                        decoder_instructions.push(DecoderInstruction::Drop {
+                            reference_ids: vec![removed.id],
+                        });
+                    }
+
+                    let pic_num_to_remove =
+                        header.frame_num as i64 - (*difference_of_pic_nums_minus1 as i64 + 1);
+
+                    let picture = self.remove_short_term_ref(
+                        header.frame_num.into(),
+                        sps,
+                        pic_num_to_remove,
+                    )?;
+
+                    if picture.non_existing {
+                        return Err(ReferenceManagementError::IncorrectData(format!(
+                            "MMCO 3 targets a non-existing short-term reference picture (pic_num = {pic_num_to_remove}), which is forbidden by H.264 §8.2.5.2 constraint d"
+                        )));
+                    }
+
+                    self.pictures.long_term.push(LongTermReferencePicture {
+                        frame_num: picture.frame_num,
+                        LongTermFrameIdx: *long_term_frame_idx as u64,
+                        pic_order_cnt: picture.pic_order_cnt,
+                        id: picture.id,
+                    });
+                }
+
+                MemoryManagementControlOperation::MaxUsedLongTermFrameRef {
+                    max_long_term_frame_idx_plus1,
+                } => {
+                    if *max_long_term_frame_idx_plus1 != 0 {
+                        self.MaxLongTermFrameIdx =
+                            MaxLongTermFrameIdx::Idx(*max_long_term_frame_idx_plus1 as u64 - 1);
+                    } else {
+                        self.MaxLongTermFrameIdx = MaxLongTermFrameIdx::NoLongTermFrameIndices;
+                    }
+
+                    let max_idx = *max_long_term_frame_idx_plus1 as i128 - 1;
+
+                    let reference_ids_to_remove = self
+                        .pictures
+                        .long_term
+                        .iter()
+                        .filter(|p| p.LongTermFrameIdx as i128 > max_idx)
+                        .map(|p| p.id)
+                        .collect();
+
+                    self.pictures.long_term = self
+                        .pictures
+                        .long_term
+                        .iter()
+                        .filter(|p| p.LongTermFrameIdx as i128 <= max_idx)
+                        .cloned()
+                        .collect();
+
+                    decoder_instructions.push(DecoderInstruction::Drop {
+                        reference_ids: reference_ids_to_remove,
+                    })
+                }
+
+                MemoryManagementControlOperation::AllRefPicturesUnused => {
+                    let reference_ids = self
+                        .pictures
+                        .short_term
+                        .drain(..)
+                        .filter(|p| !p.non_existing)
+                        .map(|p| p.id)
+                        .chain(self.pictures.long_term.drain(..).map(|p| p.id))
+                        .collect();
+
+                    self.MaxLongTermFrameIdx = MaxLongTermFrameIdx::NoLongTermFrameIndices;
+
+                    decoder_instructions.push(DecoderInstruction::Drop { reference_ids })
+                }
+                MemoryManagementControlOperation::CurrentUsedForLongTerm {
+                    long_term_frame_idx,
+                } => {
+                    if let Ok(picture) = self.remove_long_term_ref(*long_term_frame_idx as u64) {
+                        decoder_instructions.push(DecoderInstruction::Drop {
+                            reference_ids: vec![picture.id],
+                        });
+                    }
+
+                    new_long_term_frame_idx = Some(*long_term_frame_idx as u64);
+                }
+            }
+        }
+
+        let reference_id = match new_long_term_frame_idx {
+            Some(long_term_frame_idx) => self.add_long_term_reference(
+                header.frame_num,
+                long_term_frame_idx,
+                decode_info.picture_info.PicOrderCnt_as_reference_pic,
+            ),
+            None => self.add_short_term_reference(
+                header.frame_num,
+                decode_info.picture_info.PicOrderCnt_as_reference_pic,
+            ),
+        };
+
+        decoder_instructions.insert(
+            0,
+            DecoderInstruction::Decode {
+                decode_info,
+                reference_id,
+            },
+        );
+
+        if let MaxLongTermFrameIdx::Idx(max) = self.MaxLongTermFrameIdx {
+            if self.pictures.long_term.len() > max as usize + 1 {
+                return Err(ReferenceManagementError::IncorrectData(format!(
+                    "there are {} long-term references, but there shouldn't be more than {max}",
+                    self.pictures.long_term.len()
+                )));
+            }
+        }
+
+        Ok(decoder_instructions)
+    }
+
+    fn reference_picture_marking_process_sliding_window(
+        &mut self,
+        sps: &SeqParameterSet,
+        header: Arc<SliceHeader>,
+        decode_info: DecodeInformation,
+    ) -> Result<Vec<DecoderInstruction>, ReferenceManagementError> {
+        let reference_id = self.add_short_term_reference(
+            header.frame_num,
+            decode_info.picture_info.PicOrderCnt_as_reference_pic,
+        );
+
+        let mut decoder_instructions = vec![DecoderInstruction::Decode {
+            decode_info,
+            reference_id,
+        }];
+
+        decoder_instructions
+            .extend(self.evict_oldest_short_term_if_over_capacity(sps, header.frame_num));
+
+        Ok(decoder_instructions)
+    }
+
+    fn evict_oldest_short_term_if_over_capacity(
+        &mut self,
+        sps: &SeqParameterSet,
+        current_frame_num: u16,
+    ) -> Option<DecoderInstruction> {
+        let max_num_ref = sps.max_num_ref_frames.max(1) as usize;
+        if self.pictures.short_term.len() + self.pictures.long_term.len() <= max_num_ref {
+            return None;
+        }
+        if self.pictures.short_term.is_empty() {
+            return None;
+        }
+
+        let (idx, _) = self
+            .pictures
+            .short_term
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, reference)| {
+                decode_picture_numbers_for_short_term_ref(
+                    reference.frame_num.into(),
+                    current_frame_num.into(),
+                    sps,
+                )
+                .FrameNumWrap
+            })
+            .unwrap();
+
+        let removed = self.pictures.short_term.remove(idx);
+        if removed.non_existing {
+            None
+        } else {
+            Some(DecoderInstruction::Drop {
+                reference_ids: vec![removed.id],
+            })
+        }
+    }
+
+    fn reference_picture_marking_process_idr(
+        &mut self,
+        header: Arc<SliceHeader>,
+        decode_info: DecodeInformation,
+        long_term_reference_flag: bool,
+    ) -> Result<Vec<DecoderInstruction>, ReferenceManagementError> {
+        self.reset_state();
+
+        let reference_id = if long_term_reference_flag {
+            self.MaxLongTermFrameIdx = MaxLongTermFrameIdx::Idx(0);
+            self.add_long_term_reference(
+                header.frame_num,
+                0,
+                decode_info.picture_info.PicOrderCnt_as_reference_pic,
+            )
+        } else {
+            self.MaxLongTermFrameIdx = MaxLongTermFrameIdx::NoLongTermFrameIndices;
+            self.add_short_term_reference(
+                header.frame_num,
+                decode_info.picture_info.PicOrderCnt_as_reference_pic,
+            )
+        };
+
+        Ok(vec![DecoderInstruction::Idr {
+            decode_info,
+            reference_id,
+        }])
+    }
+
+    #[allow(non_snake_case)]
+    fn decode_information_for_frame(
+        &mut self,
+        header: Arc<SliceHeader>,
+        slice_indices: Vec<usize>,
+        rbsp_bytes: Vec<u8>,
+        sps: &SeqParameterSet,
+        pps: &PicParameterSet,
+        pts: Option<u64>,
+    ) -> Result<DecodeInformation, ReferenceManagementError> {
+        let PicOrderCnt_for_decoding = self.decode_pic_order_cnt(&header, sps)?;
+        let PicOrderCnt_as_reference_pic = if header.includes_mmco_equal_5() {
+            [0, 0]
+        } else {
+            PicOrderCnt_for_decoding
+        };
+
+        match header.slice_type.family {
+            h264_reader::nal::slice::SliceFamily::P
+            | h264_reader::nal::slice::SliceFamily::B
+            | h264_reader::nal::slice::SliceFamily::I => {}
+            h264_reader::nal::slice::SliceFamily::SP => {
+                return Err(ReferenceManagementError::SPFramesNotSupported);
+            }
+            h264_reader::nal::slice::SliceFamily::SI => {
+                return Err(ReferenceManagementError::SIFramesNotSupported);
+            }
+        }
+
+        // An IDR picture invalidates the whole DPB before it is decoded (H.264 spec 8.2.5.1), so
+        // there is nothing to hand over as reference pictures.
+        let reference_pictures = if matches!(
+            header.dec_ref_pic_marking,
+            Some(DecRefPicMarking::Idr { .. })
+        ) {
+            Vec::new()
+        } else {
+            self.reference_pictures_for_frame(&header, sps)
+        };
+
+        Ok(DecodeInformation {
+            reference_pictures,
+            header: header.clone(),
+            slice_indices,
+            rbsp_bytes,
+            sps_id: sps.id().id(),
+            pps_id: pps.pic_parameter_set_id.id(),
+            picture_info: PictureInfo {
+                non_existing: false,
+                used_for_long_term_reference: false,
+                PicOrderCnt_for_decoding,
+                PicOrderCnt_as_reference_pic,
+                FrameNum: header.frame_num,
+            },
+            pts,
+            max_num_reorder_frames: calculate_max_num_reorder_frames(sps)?,
+        })
+    }
+
+    // This is outside of spec, but I think it would not be good if a malicious bitstream could
+    // trivially force us to do an arbitrary amount of work
+    const MAX_GAP_SIZE: u32 = 512;
+
+    #[allow(non_snake_case)]
+    fn handle_gaps_in_frame_num(
+        &mut self,
+        sps: &SeqParameterSet,
+        target_frame_num: u16,
+    ) -> Result<Vec<DecoderInstruction>, ReferenceManagementError> {
+        let MaxFrameNum = sps.max_frame_num() as u32;
+        let mut UnusedShortTermFrameNum = (self.PrevRefFrameNum as u32 + 1) % MaxFrameNum;
+        let mut instructions = Vec::new();
+        let mut iterations = 0u32;
+
+        while UnusedShortTermFrameNum != target_frame_num as u32 {
+            iterations += 1;
+            if iterations > Self::MAX_GAP_SIZE {
+                return Err(ReferenceManagementError::IncorrectData(format!(
+                    "gap in frame_num exceeds {}: PrevRefFrameNum={}, target={}",
+                    Self::MAX_GAP_SIZE,
+                    self.PrevRefFrameNum,
+                    target_frame_num
+                )));
+            }
+            let frame_num = UnusedShortTermFrameNum as u16;
+
+            let pic_order_cnt = match sps.pic_order_cnt {
+                h264_reader::nal::sps::PicOrderCntType::TypeZero { .. } => [0; 2],
+                h264_reader::nal::sps::PicOrderCntType::TypeOne { .. } => {
+                    return Err(ReferenceManagementError::PicOrderCntTypeNotSupported(1));
+                }
+                h264_reader::nal::sps::PicOrderCntType::TypeTwo => {
+                    self.decode_pic_order_cnt_type_two(sps, frame_num, false, true)
+                }
+            };
+
+            self.add_non_existing_short_term_reference(frame_num, pic_order_cnt);
+            // we only have to do this, because since vulkan never sees the non-existing frames, the
+            // only effect they have on it is removing some existing entries
+            instructions.extend(self.evict_oldest_short_term_if_over_capacity(sps, frame_num));
+
+            self.prevFrameNum = frame_num;
+            self.PrevRefFrameNum = frame_num;
+            self.previous_picture_included_mmco_equal_5 = false;
+
+            UnusedShortTermFrameNum = (UnusedShortTermFrameNum + 1) % MaxFrameNum;
+        }
+
+        Ok(instructions)
+    }
+
+    fn decode_pic_order_cnt(
+        &mut self,
+        header: &SliceHeader,
+        sps: &SeqParameterSet,
+    ) -> Result<[i32; 2], ReferenceManagementError> {
+        match sps.pic_order_cnt {
+            h264_reader::nal::sps::PicOrderCntType::TypeZero {
+                log2_max_pic_order_cnt_lsb_minus4,
+            } => self.decode_pic_order_cnt_type_zero(header, log2_max_pic_order_cnt_lsb_minus4),
+
+            h264_reader::nal::sps::PicOrderCntType::TypeOne { .. } => {
+                Err(ReferenceManagementError::PicOrderCntTypeNotSupported(1))
+            }
+
+            h264_reader::nal::sps::PicOrderCntType::TypeTwo => Ok(self
+                .decode_pic_order_cnt_type_two(
+                    sps,
+                    header.frame_num,
+                    header.idr_pic_id.is_some(),
+                    header.dec_ref_pic_marking.is_some(),
+                )),
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn decode_pic_order_cnt_type_two(
+        &mut self,
+        sps: &SeqParameterSet,
+        frame_num: u16,
+        is_idr: bool,
+        is_reference: bool,
+    ) -> [i32; 2] {
+        let FrameNumOffset = if is_idr {
+            0
+        } else {
+            let prevFrameNumOffset = if self.previous_picture_included_mmco_equal_5 {
+                0
+            } else {
+                self.prevFrameNumOffset
+            };
+
+            if self.prevFrameNum > frame_num {
+                prevFrameNumOffset + sps.max_frame_num()
+            } else {
+                prevFrameNumOffset
+            }
+        };
+
+        let tempPicOrderCnt = if is_idr {
+            0
+        } else if !is_reference {
+            2 * (FrameNumOffset as i32 + frame_num as i32) - 1
+        } else {
+            2 * (FrameNumOffset as i32 + frame_num as i32)
+        };
+
+        self.prevFrameNumOffset = FrameNumOffset;
+
+        [tempPicOrderCnt; 2]
+    }
+
+    fn decode_pic_order_cnt_type_zero(
+        &mut self,
+        header: &SliceHeader,
+        log2_max_pic_order_cnt_lsb_minus4: u8,
+    ) -> Result<[i32; 2], ReferenceManagementError> {
+        let pic_order_cnt_lsb =
+            header
+                .pic_order_cnt_lsb
+                .as_ref()
+                .ok_or(ReferenceManagementError::IncorrectData(
+                "pic_order_cnt_lsb is not present in a slice header, but is required for decoding"
+                    .into(),
+            ))?;
+
+        let (pic_order_cnt_lsb, delta_pic_order_cnt_bottom) = match pic_order_cnt_lsb{
+            h264_reader::nal::slice::PicOrderCountLsb::Frame(pic_order_cnt_lsb) => {
+                (*pic_order_cnt_lsb, 0)
+            }
+
+            h264_reader::nal::slice::PicOrderCountLsb::FieldsAbsolute {
+                pic_order_cnt_lsb,
+                delta_pic_order_cnt_bottom,
+            } => (*pic_order_cnt_lsb, *delta_pic_order_cnt_bottom),
+
+            h264_reader::nal::slice::PicOrderCountLsb::FieldsDelta(_) => {
+                return Err(ReferenceManagementError::IncorrectData("pic_order_cnt_lsb is not present in a slice header, but is required for decoding".into()))
+            }
+        };
+
+        let is_idr = header.idr_pic_id.is_some();
+        let pic_order_cnt_lsb = pic_order_cnt_lsb as i32;
+        let is_frame = header.field_pic == h264_reader::nal::slice::FieldPic::Frame;
+
+        // this section is very hard to read, but all of this code is just copied from the
+        // h.264 spec, where it looks almost exactly like this
+        let max_pic_order_cnt_lsb = 2_i32.pow(log2_max_pic_order_cnt_lsb_minus4 as u32 + 4);
+
+        let (prev_pic_order_cnt_msb, prev_pic_order_cnt_lsb) = if is_idr {
+            (0, 0)
+        } else {
+            (self.prev_pic_order_cnt_msb, self.prev_pic_order_cnt_lsb)
+        };
+
+        let pic_order_cnt_msb = if pic_order_cnt_lsb < prev_pic_order_cnt_lsb
+            && prev_pic_order_cnt_lsb - pic_order_cnt_lsb >= max_pic_order_cnt_lsb / 2
+        {
+            prev_pic_order_cnt_msb + max_pic_order_cnt_lsb
+        } else if pic_order_cnt_lsb > prev_pic_order_cnt_lsb
+            && pic_order_cnt_lsb - prev_pic_order_cnt_lsb > max_pic_order_cnt_lsb / 2
+        {
+            prev_pic_order_cnt_msb - max_pic_order_cnt_lsb
+        } else {
+            prev_pic_order_cnt_msb
+        };
+
+        let pic_order_cnt = if is_frame {
+            let top_field_order_cnt = pic_order_cnt_msb + pic_order_cnt_lsb;
+
+            let bottom_field_order_cnt = top_field_order_cnt + delta_pic_order_cnt_bottom;
+
+            top_field_order_cnt.min(bottom_field_order_cnt)
+        } else {
+            pic_order_cnt_msb + pic_order_cnt_lsb
+        };
+
+        self.prev_pic_order_cnt_msb = pic_order_cnt_msb;
+        self.prev_pic_order_cnt_lsb = pic_order_cnt_lsb;
+
+        Ok([pic_order_cnt; 2])
+    }
+
+    /// Returns every picture currently held in the DPB, in the form the decoding backend expects
+    /// as its active reference pictures for the current frame.
+    ///
+    /// The reference picture list construction and modification processes (H.264 spec 8.2.4) are
+    /// deliberately *not* performed here. Vulkan Video drivers parse the slice headers themselves
+    /// and build `RefPicList0`/`RefPicList1` from the set of reference slots they are given, so the
+    /// application has to hand over the whole DPB. This mirrors what ffmpeg's Vulkan hwaccel does.
+    ///
+    /// Short-term pictures come first, most recent first, followed by long-term pictures in
+    /// ascending `LongTermFrameIdx` order. Non-existing pictures (inferred for gaps in `frame_num`)
+    /// are skipped, because they are never sent to the backend and have no DPB slot.
+    fn reference_pictures_for_frame(
+        &self,
+        header: &SliceHeader,
+        sps: &SeqParameterSet,
+    ) -> Vec<ReferencePictureInfo> {
+        let mut short_term = self
+            .pictures
+            .short_term
+            .iter()
+            .filter(|pic| !pic.non_existing)
+            .map(|pic| {
+                let numbers = decode_picture_numbers_for_short_term_ref(
+                    pic.frame_num.into(),
+                    header.frame_num.into(),
+                    sps,
+                );
+                (numbers.FrameNumWrap, pic)
+            })
+            .collect::<Vec<_>>();
+        short_term.sort_by_key(|(frame_num_wrap, _)| -*frame_num_wrap);
+
+        let mut long_term = self.pictures.long_term.iter().collect::<Vec<_>>();
+        long_term.sort_by_key(|pic| pic.LongTermFrameIdx);
+
+        short_term
+            .into_iter()
+            .map(|(_, pic)| ReferencePictureInfo {
+                id: pic.id,
+                LongTermFrameIdx: None,
+                FrameNum: pic.frame_num,
+                PicOrderCnt: pic.pic_order_cnt,
+            })
+            .chain(long_term.into_iter().map(|pic| ReferencePictureInfo {
+                id: pic.id,
+                LongTermFrameIdx: Some(pic.LongTermFrameIdx),
+                FrameNum: pic.frame_num,
+                PicOrderCnt: pic.pic_order_cnt,
+            }))
+            .collect()
+    }
+
+    fn verify_frame_num(
+        &mut self,
+        sps: &SeqParameterSet,
+        header: &SliceHeader,
+    ) -> Result<(), ReferenceManagementError> {
+        let is_expected_frame_num = !sps.gaps_in_frame_num_value_allowed_flag
+            && header.frame_num != self.PrevRefFrameNum
+            && header.frame_num != ((self.PrevRefFrameNum as i64 + 1) % sps.max_frame_num()) as u16;
+        if is_expected_frame_num || self.detected_corrupted_state {
+            self.detected_corrupted_state = true;
+            return Err(ReferenceManagementError::CorruptedState);
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct ShortTermReferencePicture {
+    frame_num: u16,
+    id: ReferenceId,
+    pic_order_cnt: [i32; 2],
+    non_existing: bool,
+}
+
+#[allow(non_snake_case)]
+fn decode_picture_numbers_for_short_term_ref(
+    frame_num: i64,
+    current_frame_num: i64,
+    sps: &SeqParameterSet,
+) -> ShortTermReferencePictureNumbers {
+    let MaxFrameNum = sps.max_frame_num();
+
+    let FrameNum = frame_num;
+
+    let FrameNumWrap = if FrameNum > current_frame_num {
+        FrameNum - MaxFrameNum
+    } else {
+        FrameNum
+    };
+
+    // this assumes we're dealing with a short-term reference frame
+    let PicNum = FrameNumWrap;
+
+    ShortTermReferencePictureNumbers {
+        FrameNumWrap,
+        PicNum,
+    }
+}
+
+#[derive(Debug, Clone)]
+#[allow(non_snake_case)]
+struct LongTermReferencePicture {
+    frame_num: u16,
+    LongTermFrameIdx: u64,
+    id: ReferenceId,
+    pic_order_cnt: [i32; 2],
+}
+
+#[allow(non_snake_case)]
+struct ShortTermReferencePictureNumbers {
+    FrameNumWrap: i64,
+
+    PicNum: i64,
+}
+
+#[derive(Debug, Default)]
+struct ReferencePictures {
+    long_term: Vec<LongTermReferencePicture>,
+    short_term: Vec<ShortTermReferencePicture>,
+}
+
+trait SliceHeaderExt {
+    fn includes_mmco_equal_5(&self) -> bool;
+}
+
+impl SliceHeaderExt for SliceHeader {
+    fn includes_mmco_equal_5(&self) -> bool {
+        let Some(DecRefPicMarking::Adaptive(ref mmcos)) = self.dec_ref_pic_marking else {
+            return false;
+        };
+
+        mmcos
+            .iter()
+            .any(|mmco| matches!(mmco, MemoryManagementControlOperation::AllRefPicturesUnused))
+    }
+}
+
+#[derive(Clone)]
+pub struct DecodeInformation {
+    /// All pictures in the DPB at the time this picture is decoded, see
+    /// [`ReferenceContext::reference_pictures_for_frame`].
+    pub(crate) reference_pictures: Vec<ReferencePictureInfo>,
+    pub(crate) rbsp_bytes: Vec<u8>,
+    pub(crate) slice_indices: Vec<usize>,
+    #[cfg_attr(video_toolbox, expect(dead_code))]
+    pub(crate) header: Arc<SliceHeader>,
+    pub(crate) sps_id: u8,
+    pub(crate) pps_id: u8,
+    pub(crate) picture_info: PictureInfo,
+    pub(crate) pts: Option<u64>,
+    pub(crate) max_num_reorder_frames: u64,
+}
+
+impl std::fmt::Debug for DecodeInformation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecodeInformation")
+            .field("reference_pictures", &self.reference_pictures)
+            .field("slice_indices", &self.slice_indices)
+            .field("sps_id", &self.sps_id)
+            .field("pps_id", &self.pps_id)
+            .field("picture_info", &self.picture_info)
+            .field("pts", &self.pts)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+#[allow(non_snake_case)]
+pub(crate) struct ReferencePictureInfo {
+    #[cfg_attr(video_toolbox, expect(dead_code))]
+    pub(crate) id: ReferenceId,
+    /// `Some` for long-term reference pictures.
+    #[cfg_attr(video_toolbox, expect(dead_code))]
+    pub(crate) LongTermFrameIdx: Option<u64>,
+    #[cfg_attr(video_toolbox, expect(dead_code))]
+    pub(crate) FrameNum: u16,
+    #[cfg_attr(video_toolbox, expect(dead_code))]
+    pub(crate) PicOrderCnt: [i32; 2],
+}
+
+impl ReferencePictureInfo {
+    #[cfg(vulkan)]
+    pub fn is_long_term(&self) -> bool {
+        self.LongTermFrameIdx.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+#[allow(non_snake_case)]
+pub(crate) struct PictureInfo {
+    #[cfg_attr(video_toolbox, expect(dead_code))]
+    pub(crate) used_for_long_term_reference: bool,
+    #[cfg_attr(video_toolbox, expect(dead_code))]
+    pub(crate) non_existing: bool,
+    #[cfg_attr(video_toolbox, expect(dead_code))]
+    pub(crate) FrameNum: u16,
+    pub(crate) PicOrderCnt_for_decoding: [i32; 2],
+    pub(crate) PicOrderCnt_as_reference_pic: [i32; 2],
+}

@@ -1,0 +1,115 @@
+use std::marker::PhantomData;
+use std::sync::Arc;
+
+use crossbeam_channel::Sender;
+use tracing::warn;
+use webrtc::rtcp;
+
+use crate::prelude::*;
+use crate::{
+    error::EncoderInitError,
+    pipeline::{
+        encoder::{AudioEncoder, AudioEncoderStream, resampler::ResampledForEncoderStream},
+        rtp::payloader::{PayloaderOptions, PayloaderStream},
+    },
+    utils::{InitializableThread, ThreadMetadata},
+};
+
+use super::RtpOutputEvent;
+
+pub(crate) struct RtpAudioTrackThreadHandle {
+    pub sample_batch_sender: Sender<PipelineEvent<OutputAudioSamples>>,
+}
+
+pub(super) struct RtpAudioTrackThreadOptions<Encoder: AudioEncoder> {
+    pub ctx: Arc<PipelineCtx>,
+    pub output_ref: Ref<OutputId>,
+    pub encoder_options: Encoder::Options,
+    pub payloader_options: PayloaderOptions,
+    pub chunks_sender: Sender<RtpOutputEvent>,
+}
+
+pub(super) struct RtpAudioTrackThread<Encoder: AudioEncoder> {
+    stream: Box<dyn Iterator<Item = RtpOutputEvent>>,
+    chunks_sender: Sender<RtpOutputEvent>,
+    _encoder: PhantomData<Encoder>,
+}
+
+impl<Encoder> InitializableThread for RtpAudioTrackThread<Encoder>
+where
+    Encoder: AudioEncoder + 'static,
+{
+    type InitOptions = RtpAudioTrackThreadOptions<Encoder>;
+
+    type SpawnOutput = RtpAudioTrackThreadHandle;
+    type SpawnError = EncoderInitError;
+
+    fn init(options: Self::InitOptions) -> Result<(Self, Self::SpawnOutput), Self::SpawnError> {
+        let RtpAudioTrackThreadOptions {
+            ctx,
+            output_ref,
+            encoder_options,
+            payloader_options,
+            chunks_sender,
+        } = options;
+
+        let stats_sender = ctx.stats_sender.clone();
+        let ssrc = payloader_options.ssrc;
+        let (sample_batch_sender, sample_batch_receiver) = crossbeam_channel::bounded(5);
+
+        let resampled_stream = ResampledForEncoderStream::new(
+            sample_batch_receiver.into_iter(),
+            ctx.mixing_sample_rate,
+            encoder_options.sample_rate(),
+            encoder_options.channels(),
+        )?
+        .flatten();
+
+        let (encoded_stream, _encoder_ctx) =
+            AudioEncoderStream::<Encoder, _>::new(ctx, encoder_options, resampled_stream)?;
+
+        let payloaded_stream = PayloaderStream::new(payloader_options, encoded_stream.flatten());
+
+        let stream = payloaded_stream.flatten().map(move |event| match event {
+            // Ok(PipelineEvent::Data(packet)) => RtpOutputEvent::Data(packet),
+            Ok(PipelineEvent::Data(packet)) => {
+                stats_sender.send(
+                    RtpOutputTrackStatsEvent::BytesSent(packet.len())
+                        .into_event(&output_ref, StatsTrackKind::Audio),
+                );
+                RtpOutputEvent::Data(packet)
+            }
+            Ok(PipelineEvent::EOS) => RtpOutputEvent::AudioEos(rtcp::goodbye::Goodbye {
+                sources: vec![ssrc],
+                reason: bytes::Bytes::from("Unregister output stream"),
+            }),
+            Err(err) => RtpOutputEvent::Err(err),
+        });
+
+        let state = Self {
+            stream: Box::new(stream),
+            chunks_sender,
+            _encoder: PhantomData,
+        };
+        let output = RtpAudioTrackThreadHandle {
+            sample_batch_sender,
+        };
+        Ok((state, output))
+    }
+
+    fn run(self) {
+        for event in self.stream {
+            if self.chunks_sender.send(event).is_err() {
+                warn!("Failed to send encoded audio chunk from encoder. Channel closed.");
+                return;
+            }
+        }
+    }
+
+    fn metadata() -> ThreadMetadata {
+        ThreadMetadata {
+            thread_name: format!("Rtp Audio Encoder ({})", Encoder::LABEL),
+            thread_instance_name: "Output".to_string(),
+        }
+    }
+}

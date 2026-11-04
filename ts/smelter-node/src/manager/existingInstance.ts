@@ -1,0 +1,110 @@
+import type {
+  ApiRequest,
+  MultipartRequest,
+  SmelterManager,
+  SetupInstanceOptions,
+} from '@swmansion/smelter-core';
+
+import { sendRequest, sendMultipartRequest, joinUrl } from '../fetch';
+import { retry, sleep } from '../utils';
+import { WebSocketConnection } from '../ws';
+import { getSmelterStatus } from '../getSmelterStatus';
+
+export type ExistingInstanceOptions = {
+  url: string | URL;
+  authorizationHeader?: string;
+};
+
+/**
+ * SmelterManager that will connect to existing instance
+ */
+class ExistingInstanceManager implements SmelterManager {
+  private url: URL;
+  private authorizationHeader?: string;
+  private wsConnection: WebSocketConnection;
+
+  constructor(opts: ExistingInstanceOptions) {
+    let url: URL;
+    if (opts.url instanceof URL) {
+      url = opts.url;
+    } else {
+      url = new URL(opts.url);
+    }
+
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      throw new Error('Expected url to use either http or https protocol');
+    }
+
+    this.url = url;
+    this.authorizationHeader = opts.authorizationHeader;
+
+    const wsUrl = joinUrl(url, 'ws');
+    wsUrl.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+    this.wsConnection = new WebSocketConnection(wsUrl, opts.authorizationHeader);
+  }
+
+  public async setupInstance(opts: SetupInstanceOptions): Promise<void> {
+    await retry(async () => {
+      await sleep(500);
+      let smelterStatus = await getSmelterStatus(this);
+
+      const expectedConfig = {
+        aheadOfTimeProcessing: opts.aheadOfTimeProcessing,
+      };
+
+      const actualConfig = {
+        aheadOfTimeProcessing: smelterStatus.configuration.aheadOfTimeProcessing,
+      };
+
+      for (const [key, expected] of Object.entries(expectedConfig)) {
+        const actual = actualConfig[key as keyof typeof actualConfig];
+        if (actual !== expected) {
+          opts.logger.warn(
+            {
+              key,
+              expected: expected === undefined ? 'undefined' : expected,
+              actual: actual === undefined ? 'undefined' : actual,
+            },
+            `Mismatch between instance config and SDK.`
+          );
+        }
+      }
+      return smelterStatus;
+    }, 10);
+
+    await this.sendRequest({
+      method: 'POST',
+      route: '/api/reset',
+      body: {},
+    });
+    opts.logger.info('Sent reset request to the Smelter instance.');
+
+    await this.wsConnection.connect(opts.logger);
+  }
+
+  public async sendRequest(request: ApiRequest): Promise<object> {
+    let headers = {
+      ...request.headers,
+      ...(this.authorizationHeader ? { Authorization: this.authorizationHeader } : {}),
+    };
+    return await sendRequest(this.url, { ...request, headers });
+  }
+
+  async sendMultipartRequest(request: MultipartRequest): Promise<object> {
+    let headers = {
+      ...request.headers,
+      ...(this.authorizationHeader ? { Authorization: this.authorizationHeader } : {}),
+    };
+    return await sendMultipartRequest(this.url, { ...request, headers });
+  }
+
+  public registerEventListener(cb: (event: object) => void): void {
+    this.wsConnection.registerEventListener(cb);
+  }
+
+  public async terminate(): Promise<void> {
+    await this.wsConnection.close();
+  }
+}
+
+export default ExistingInstanceManager;

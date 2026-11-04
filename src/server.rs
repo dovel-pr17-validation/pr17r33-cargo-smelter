@@ -1,0 +1,108 @@
+use crossbeam_channel::Receiver;
+use rustls::crypto::aws_lc_rs;
+use signal_hook::{consts, iterator::Signals};
+use smelter_render::error::ErrorStack;
+use tokio::runtime::{Builder, Runtime};
+use tracing::{error, info};
+
+use std::{net::SocketAddr, process, sync::Arc, thread};
+
+use crate::{config::read_config, logger::init_logger, routes::routes, state::ApiState};
+
+pub fn run() {
+    listen_for_parent_termination();
+    let config = read_config();
+    init_logger(config.logger.clone());
+    aws_lc_rs::default_provider().install_default().unwrap();
+
+    info!("Starting Smelter with config:\n{:#?}", config);
+    let state = ApiState::new(config).unwrap_or_else(|err| {
+        panic!(
+            "Failed to start Smelter instance.\n{}",
+            ErrorStack::new(&err).into_string()
+        )
+    });
+    let chromium_context = state.chromium_context.clone();
+
+    thread::Builder::new()
+        .name("HTTP server startup thread".to_string())
+        .spawn(move || {
+            let (_should_close_sender, should_close_receiver) = crossbeam_channel::bounded(1);
+            // Runtime for the HTTP API only, pipelines create their own runtimes. Pipeline
+            // calls run in the blocking pool, so a few workers are enough.
+            let runtime = Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(2)
+                .build()
+                .unwrap();
+            if let Err(err) = run_api(state, &runtime, should_close_receiver) {
+                error!(%err);
+                process::exit(1);
+            }
+        })
+        .unwrap();
+    match chromium_context {
+        None => {
+            let mut signals = Signals::new([consts::SIGINT]).unwrap();
+            signals.forever().next();
+        }
+        Some(chromium_context) => {
+            if let Err(err) = chromium_context.run_event_loop() {
+                panic!(
+                    "Failed to start event loop.\n{}",
+                    ErrorStack::new(&err).into_string()
+                )
+            }
+        }
+    }
+}
+
+pub fn run_api(
+    state: Arc<ApiState>,
+    runtime: &Runtime,
+    should_close: Receiver<()>,
+) -> tokio::io::Result<()> {
+    runtime.block_on(async {
+        let port = state.config.api_port;
+        let app = routes(state);
+        let listener =
+            tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
+
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                should_close.recv().unwrap();
+            })
+            .await
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn listen_for_parent_termination() {
+    use libc::{SIGTERM, prctl};
+    unsafe {
+        prctl(libc::PR_SET_PDEATHSIG, SIGTERM);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn listen_for_parent_termination() {
+    use libc::SIGTERM;
+    use std::{os::unix::process::parent_id, time::Duration};
+    let ppid = parent_id();
+
+    thread::Builder::new()
+        .name("Parent process pid change".to_string())
+        .spawn(move || {
+            loop {
+                let current_pid = parent_id();
+                if current_pid != ppid {
+                    info!("Compositor parent process was terminated.");
+                    unsafe {
+                        libc::kill(std::process::id() as libc::c_int, SIGTERM);
+                    }
+                }
+                thread::sleep(Duration::from_secs(1));
+            }
+        })
+        .unwrap();
+}

@@ -1,0 +1,175 @@
+use std::{sync::Arc, time::Duration};
+
+use tokio::time::timeout;
+use tracing::{Instrument, Level, debug, span};
+use url::Url;
+
+use crate::{
+    AudioChannels,
+    pipeline::{
+        input::Input,
+        rtp::{RtpJitterBufferMode, RtpJitterBufferSharedContext},
+        webrtc::{
+            http_client::{SdpAnswer, WhipWhepHttpClient},
+            peer_connection_recvonly::RecvonlyPeerConnection,
+            supported_codec_parameters::opus_codec_params,
+            whep_input::{
+                WhepTrackContext, listen_for_trickle_candidates::listen_for_trickle_candidates,
+                on_track::handle_on_track, resolve_video_preferences::resolve_video_preferences,
+            },
+        },
+    },
+    queue::{QueueInput, QueueTrackOffset, QueueTrackOptions},
+};
+
+use crate::prelude::*;
+
+const WHEP_INIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// WHEP input - connects to a remote WebRTC endpoint via WHEP HTTP client,
+/// decodes, and feeds frames/samples into the queue.
+///
+/// ## Codec negotiation
+///
+/// This side creates the SDP offer. For H.264 decoders (FFmpeg and Vulkan), we
+/// advertise constrained baseline, main, and high profiles with the highest
+/// supported level per profile. For FfmpegH264 this is always level 5.1;
+/// for VulkanH264 the levels come from the GPU's reported decode capabilities.
+/// Offer is sent to the server, answer is applied as remote description.
+///
+/// ## Timestamps
+///
+/// - Connection is established during input registration (with a 60s timeout).
+/// - PTS of first frame will be synced to `queue_sync_point` Instant
+/// - Register track with `QueueTrackOffset::Pts(Duration::ZERO)`
+/// - Jitter buffer: `RtpJitterBufferMode::RealTime` produces timestamps already in the correct
+///   time frame
+/// - No way to reconnect
+///
+/// ### Unsupported scenarios
+/// - If ahead of time processing is enabled, initial registration will happen on pts already
+///   processed by the queue, but queue will wait and eventually stream will show up, with
+///   the portion at the start cut off.
+/// - If other input is required and delays queue by X relative to `queue_sync_point.elapsed()`:
+///   - If X is smaller than channel sizes then, this input latency will
+///     be artificially increased by X.
+///   - If X is larger than channel size then, this input will be intermittently
+///     blank and streaming until the other inputs (and queue processing) catch up.
+#[derive(Debug)]
+pub(crate) struct WhepInput {
+    ctx: Arc<PipelineCtx>,
+    session_url: Url,
+    client: Arc<WhipWhepHttpClient>,
+    _peer_connection: RecvonlyPeerConnection,
+}
+
+impl WhepInput {
+    pub(crate) fn new_input(
+        ctx: Arc<PipelineCtx>,
+        input_ref: Ref<InputId>,
+        options: WhepInputOptions,
+    ) -> Result<(Input, InputInitInfo, QueueInput), InputInitError> {
+        let span = span!(
+            Level::INFO,
+            "WHEP client task",
+            input_id = input_ref.to_string()
+        );
+        let init_result = ctx.block_on_async_task(|ctx| async {
+            // timeout has to be created inside tokio runtime
+            timeout(WHEP_INIT_TIMEOUT, init_whep_client(input_ref, ctx, options))
+                .instrument(span)
+                .await
+        });
+        match init_result {
+            Ok(result) => result.map_err(|err| Box::new(err).into()),
+            Err(_) => Err(Box::new(WebrtcClientError::Timeout).into()),
+        }
+    }
+}
+
+impl Drop for WhepInput {
+    fn drop(&mut self) {
+        let session_url = self.session_url.clone();
+        let client = self.client.clone();
+        self.ctx.tokio_rt.spawn(async move {
+            client.delete_session(session_url).await;
+        });
+    }
+}
+
+async fn init_whep_client(
+    input_ref: Ref<InputId>,
+    ctx: Arc<PipelineCtx>,
+    options: WhepInputOptions,
+) -> Result<(Input, InputInitInfo, QueueInput), WebrtcClientError> {
+    let client = WhipWhepHttpClient::new(&options.endpoint_url, &options.bearer_token)?;
+    let (video_preferences, video_codecs_params) =
+        resolve_video_preferences(&ctx, options.video_preferences)?;
+
+    // WHEP input creates the offer (client side), so use hardcoded audio codec defaults.
+    // Our decoder supports only stereo.
+    let audio_codecs_params = opus_codec_params(true /* fec_first */, AudioChannels::Stereo);
+    let pc = RecvonlyPeerConnection::new(&ctx, &video_codecs_params, &audio_codecs_params).await?;
+
+    let _video_transceiver = pc.new_video_track(&video_codecs_params).await?;
+    let _audio_transceiver = pc.new_audio_track().await?;
+
+    let offer = pc.create_offer(None).await?;
+    debug!("SDP offer: {}", offer.sdp);
+
+    let SdpAnswer {
+        session_url,
+        answer,
+    } = client.send_offer(&offer).await?;
+    debug!("SDP answer: {}", answer.sdp);
+
+    pc.set_local_description(offer).await?;
+
+    listen_for_trickle_candidates(&pc, &client, session_url.clone());
+
+    pc.set_remote_description(answer).await?;
+
+    let queue_input = QueueInput::new(&ctx, &input_ref, options.queue_options);
+    queue_input.set_stale_frame_timeout(ctx.stale_frame_timeout);
+    {
+        let input_ref = input_ref.clone();
+        let ctx = ctx.clone();
+        let desired_size = match options.jitter_buffer_size {
+            Some(v) => (v, v.saturating_add(Duration::from_millis(80))),
+            None => (Duration::from_millis(240), Duration::from_millis(320)),
+        };
+        let buffer = RtpJitterBufferSharedContext::new(
+            &ctx,
+            RtpJitterBufferMode::RealTime { desired_size },
+            ctx.queue_ctx.sync_point,
+        );
+
+        let (mut video_sender, mut audio_sender) = queue_input.queue_new_track(QueueTrackOptions {
+            video: true,
+            audio: true,
+            offset: QueueTrackOffset::Pts(Timestamp::ZERO),
+        });
+
+        pc.on_track(move |track_ctx| {
+            let ctx = WhepTrackContext::new(track_ctx, &ctx, &buffer);
+            handle_on_track(
+                ctx,
+                input_ref.clone(),
+                video_preferences.clone(),
+                &mut video_sender,
+                &mut audio_sender,
+            );
+        });
+    }
+
+    Ok((
+        Input::Whep(WhepInput {
+            ctx,
+            session_url,
+            client,
+            _peer_connection: pc,
+        }),
+        InputInitInfo::Other,
+        queue_input,
+    ))
+}

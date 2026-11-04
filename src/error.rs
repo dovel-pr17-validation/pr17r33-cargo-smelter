@@ -1,0 +1,128 @@
+use std::fmt::Display;
+
+use axum::{http::StatusCode, response::IntoResponse};
+use serde::Serialize;
+use smelter_api::{ErrorType, PipelineErrorInfo, TypeError};
+use smelter_core::error::{
+    InitPipelineError, RegisterInputError, RegisterOutputError, UnregisterInputError,
+    UnregisterOutputError, UpdateInputError,
+};
+use smelter_render::error::{
+    ErrorStack, RegisterFontError, RegisterRendererError, RequestKeyframeError,
+    UnregisterRendererError, UpdateSceneError,
+};
+use utoipa::ToSchema;
+
+#[derive(Debug, ToSchema)]
+pub struct ApiError {
+    pub error_code: &'static str,
+    pub message: String,
+    pub stack: Vec<String>,
+
+    /// Sent as the HTTP status, not as part of the body.
+    #[schema(ignore, value_type = u16)]
+    pub http_status_code: StatusCode,
+}
+
+impl ApiError {
+    pub fn new(error_code: &'static str, message: String, http_status_code: StatusCode) -> Self {
+        ApiError {
+            error_code,
+            message: message.clone(),
+            stack: vec![message],
+            http_status_code,
+        }
+    }
+
+    /// Request could not be parsed.
+    pub fn malformed_request(err: &dyn Display) -> Self {
+        ApiError::new(
+            "MALFORMED_REQUEST",
+            format!("Received malformed request:\n{err}"),
+            StatusCode::BAD_REQUEST,
+        )
+    }
+
+    /// Request was parsed, but its content is not valid.
+    pub fn invalid_request(err: &dyn Display) -> Self {
+        ApiError::new(
+            "MALFORMED_REQUEST",
+            format!("Received invalid request:\n{err}"),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        )
+    }
+}
+
+fn pipeline_error_to_api<T>(err: T) -> ApiError
+where
+    T: std::error::Error + 'static,
+    PipelineErrorInfo: for<'a> From<&'a T>,
+{
+    let stack: Vec<String> = ErrorStack::new(&err).map(ToString::to_string).collect();
+    let err_info = PipelineErrorInfo::from(&err);
+    ApiError {
+        error_code: err_info.error_code,
+        message: stack.first().unwrap().clone(),
+        stack,
+        http_status_code: match err_info.error_type {
+            ErrorType::UserError => StatusCode::BAD_REQUEST,
+            ErrorType::EntityNotFound => StatusCode::NOT_FOUND,
+            ErrorType::Conflict => StatusCode::CONFLICT,
+
+            ErrorType::BadGateway => StatusCode::BAD_GATEWAY,
+            ErrorType::ServerError => StatusCode::INTERNAL_SERVER_ERROR,
+        },
+    }
+}
+
+macro_rules! impl_api_err {
+    ($type:ty) => {
+        impl From<$type> for ApiError {
+            fn from(err: $type) -> Self {
+                pipeline_error_to_api(err)
+            }
+        }
+    };
+}
+
+impl_api_err!(RegisterInputError);
+impl_api_err!(RegisterOutputError);
+impl_api_err!(RegisterRendererError);
+impl_api_err!(RegisterFontError);
+impl_api_err!(RequestKeyframeError);
+impl_api_err!(UnregisterInputError);
+impl_api_err!(UpdateInputError);
+impl_api_err!(UnregisterOutputError);
+impl_api_err!(UnregisterRendererError);
+impl_api_err!(UpdateSceneError);
+impl_api_err!(InitPipelineError);
+
+impl From<TypeError> for ApiError {
+    fn from(err: TypeError) -> Self {
+        ApiError::invalid_request(&err)
+    }
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        #[derive(Serialize)]
+        struct ErrorResponse {
+            error_code: &'static str,
+            message: String,
+            stack: Vec<String>,
+        }
+
+        let body = axum::Json(ErrorResponse {
+            error_code: self.error_code,
+            message: self.message,
+            stack: self.stack,
+        });
+        (self.http_status_code, body).into_response()
+    }
+}

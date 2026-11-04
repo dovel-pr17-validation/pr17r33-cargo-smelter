@@ -1,0 +1,624 @@
+use std::{
+    env,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
+
+use rand::Rng;
+use rtmp::TlsConfig;
+use smelter_core::DEFAULT_BUFFER_DURATION;
+use smelter_render::{DEFAULT_MAX_LAYOUTS_COUNT, Framerate, RenderingMode, WgpuFeatures};
+
+use crate::logger::FfmpegLogLevel;
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub instance_id: String,
+    pub logger: LoggerConfig,
+
+    pub api_port: u16,
+    pub download_root: Arc<Path>,
+    pub stale_frame_timeout: Duration,
+    pub default_buffer_duration: Duration,
+    pub side_channel_socket_dir: Option<Arc<Path>>,
+
+    pub ahead_of_time_processing: bool,
+    pub run_late_scheduled_events: bool,
+    pub never_drop_output_frames: bool,
+    pub load_system_fonts: bool,
+
+    pub mixing_sample_rate: u32,
+    pub output_framerate: Framerate,
+
+    pub rendering_mode: RenderingMode,
+    pub render_max_layouts_count: usize,
+    pub wgpu_force_gpu: bool,
+    pub wgpu_required_features: WgpuFeatures,
+    pub gpu_device_id: Option<u32>,
+    pub gpu_driver_name: Option<String>,
+
+    pub web_renderer_enable: bool,
+    pub web_renderer_gpu_enable: bool,
+
+    pub whip_whep_server_port: u16,
+    pub whip_whep_enable: bool,
+    pub webrtc_stun_servers: Arc<Vec<String>>,
+    pub webrtc_udp_port_strategy: Option<WebrtcUdpPortStrategy>,
+    pub webrtc_nat_1to1_ips: Arc<Vec<String>>,
+
+    pub rtmp_server_port: u16,
+    pub rtmp_enable: bool,
+    pub rtmp_tls_config: Option<TlsConfig>,
+
+    pub moq_server_port: u16,
+    pub moq_enable: bool,
+    pub moq_tls_config: Option<moq_native::ServerTlsConfig>,
+    pub moq_disable_tls_verification: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum WebrtcUdpPortStrategy {
+    PortRange(u16, u16),
+    Mux(u16),
+}
+
+#[derive(Debug, Clone)]
+pub struct LoggerConfig {
+    pub ffmpeg_logger_level: FfmpegLogLevel,
+    pub format: LoggerFormat,
+    pub stdio_level: String,
+    pub file_level: String,
+    pub log_file: Option<Arc<Path>>,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum LoggerFormat {
+    Pretty,
+    Json,
+    Compact,
+}
+
+impl FromStr for LoggerFormat {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "json" => Ok(LoggerFormat::Json),
+            "pretty" => Ok(LoggerFormat::Pretty),
+            "compact" => Ok(LoggerFormat::Compact),
+            _ => Err("invalid logger format"),
+        }
+    }
+}
+
+pub fn read_config() -> Config {
+    try_read_config().expect("Failed to read the config from environment variables")
+}
+
+fn try_read_config() -> Result<Config, String> {
+    let api_port = match env::var("SMELTER_API_PORT") {
+        Ok(api_port) => api_port
+            .parse::<u16>()
+            .map_err(|_| "SMELTER_API_PORT has to be valid port number")?,
+        Err(_) => 8081,
+    };
+
+    let instance_id = match env::var("SMELTER_INSTANCE_ID") {
+        Ok(instance_id) => instance_id,
+        Err(_) => format!("smelter_{}", rand::rng().random::<u32>()),
+    };
+
+    const DEFAULT_FRAMERATE: Framerate = Framerate { num: 30, den: 1 };
+    let output_framerate = match env::var("SMELTER_OUTPUT_FRAMERATE") {
+        Ok(framerate) => framerate_from_str(&framerate).unwrap_or(DEFAULT_FRAMERATE),
+        Err(_) => DEFAULT_FRAMERATE,
+    };
+
+    /// Valid Opus sample rates
+    const SUPPORTED_SAMPLE_RATES: [u32; 5] = [8_000, 12_000, 16_000, 24_000, 48_000];
+    const DEFAULT_MIXING_SAMPLE_RATE: u32 = 48_000;
+    let mixing_sample_rate: u32 = match env::var("SMELTER_MIXING_SAMPLE_RATE") {
+        Ok(sample_rate) => {
+            let sample_rate = sample_rate
+                .parse()
+                .map_err(|_| "SMELTER_MIXING_SAMPLE_RATE has to be a valid number")?;
+
+            if SUPPORTED_SAMPLE_RATES.contains(&sample_rate) {
+                sample_rate
+            } else {
+                return Err("SMELTER_MIXING_SAMPLE_RATE has to be a supported sample rate. Supported sample rates are: 8000, 12000, 16000, 24000, 48000".to_string());
+            }
+        }
+        Err(_) => DEFAULT_MIXING_SAMPLE_RATE,
+    };
+
+    let wgpu_force_gpu = match env::var("SMELTER_FORCE_GPU") {
+        Ok(enable) => bool_env_from_str(&enable).unwrap_or(false),
+        Err(_) => false,
+    };
+
+    let gpu_device_id = match env::var("SMELTER_GPU_DEVICE_ID") {
+        Ok(id) => Some(
+            id.parse::<u32>()
+                .map_err(|_| "SMELTER_GPU_DEVICE_ID has to be a valid number")?,
+        ),
+        Err(_) => None,
+    };
+    let gpu_driver_name = env::var("SMELTER_GPU_DEVICE_DRIVER").ok();
+
+    const DEFAULT_STREAM_FALLBACK_TIMEOUT: Duration = Duration::from_millis(3000);
+    let stale_frame_timeout = match env::var("SMELTER_STREAM_FALLBACK_TIMEOUT_MS") {
+        Ok(timeout_ms) => match timeout_ms.parse::<f64>() {
+            Ok(timeout_ms) => Duration::from_secs_f64(timeout_ms / 1000.0),
+            Err(_) => {
+                println!(
+                    "CONFIG ERROR: Invalid value provided for \"SMELTER_STREAM_FALLBACK_TIMEOUT_MS\". Falling back to default value 3000ms."
+                );
+                DEFAULT_STREAM_FALLBACK_TIMEOUT
+            }
+        },
+        Err(_) => DEFAULT_STREAM_FALLBACK_TIMEOUT,
+    };
+
+    let default_logger_level = "info,wgpu_hal=warn,wgpu_core=warn,webrtc_srtp::session=warn";
+    let logger_level = match env::var("SMELTER_LOGGER_LEVEL") {
+        Ok(level) => format!("{default_logger_level},{level}"),
+        Err(_) => default_logger_level.to_string(),
+    };
+    let stdio_logger_level = match env::var("SMELTER_STDIO_LOGGER_LEVEL") {
+        Ok(level) => format!("{logger_level},{level}"),
+        Err(_) => logger_level.clone(),
+    };
+    let file_logger_level = match env::var("SMELTER_FILE_LOGGER_LEVEL") {
+        Ok(level) => format!("{logger_level},{level}"),
+        Err(_) => logger_level.clone(),
+    };
+
+    // When building in repo use compact logger
+    let default_logger_format = match env::var("CARGO_MANIFEST_DIR") {
+        Ok(_) => LoggerFormat::Compact,
+        Err(_) => LoggerFormat::Json,
+    };
+    let logger_format = match env::var("SMELTER_LOGGER_FORMAT") {
+        Ok(format) => LoggerFormat::from_str(&format).unwrap_or(default_logger_format),
+        Err(_) => default_logger_format,
+    };
+
+    let ffmpeg_logger_level = match env::var("SMELTER_FFMPEG_LOGGER_LEVEL") {
+        Ok(ffmpeg_log_level) => {
+            FfmpegLogLevel::from_str(&ffmpeg_log_level).unwrap_or(FfmpegLogLevel::Warn)
+        }
+        Err(_) => FfmpegLogLevel::Warn,
+    };
+
+    let download_root = env::var("SMELTER_DOWNLOAD_DIR")
+        .map(|path| Arc::from(PathBuf::from(path)))
+        .unwrap_or_else(|_| Arc::from(env::temp_dir()));
+
+    let web_renderer_enable = match env::var("SMELTER_WEB_RENDERER_ENABLE") {
+        Ok(enable) => bool_env_from_str(&enable).unwrap_or(false),
+        Err(_) => false,
+    };
+
+    let web_renderer_gpu_enable = match env::var("SMELTER_WEB_RENDERER_GPU_ENABLE") {
+        Ok(enable) => bool_env_from_str(&enable).unwrap_or(true),
+        Err(_) => true,
+    };
+
+    let offline_processing: bool = match env::var("SMELTER_OFFLINE_PROCESSING_ENABLE") {
+        Ok(enable) => bool_env_from_str(&enable).unwrap_or(false),
+        Err(_) => false,
+    };
+
+    let ahead_of_time_processing: bool = match env::var("SMELTER_AHEAD_OF_TIME_PROCESSING_ENABLE") {
+        Ok(enable) => bool_env_from_str(&enable).unwrap_or(offline_processing),
+        Err(_) => offline_processing,
+    };
+
+    let never_drop_output_frames: bool = match env::var("SMELTER_NEVER_DROP_OUTPUT_FRAMES") {
+        Ok(enable) => bool_env_from_str(&enable).unwrap_or(offline_processing),
+        Err(_) => offline_processing,
+    };
+
+    let run_late_scheduled_events = match env::var("SMELTER_RUN_LATE_SCHEDULED_EVENTS") {
+        Ok(enable) => bool_env_from_str(&enable).unwrap_or(false),
+        Err(_) => false,
+    };
+
+    let default_wgpu_features: WgpuFeatures =
+        WgpuFeatures::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING;
+    let wgpu_required_features = match env::var("SMELTER_REQUIRED_WGPU_FEATURES") {
+        Ok(required_wgpu_features) => wgpu_features_from_str(&required_wgpu_features).unwrap(),
+        Err(_) => default_wgpu_features,
+    };
+
+    let default_buffer_duration = match env::var("SMELTER_INPUT_BUFFER_DURATION_MS") {
+        Ok(duration) => match duration.parse::<f64>() {
+            Ok(duration) => Duration::from_secs_f64(duration / 1000.0),
+            Err(_) => {
+                println!(
+                    "CONFIG ERROR: Invalid value provided for \"SMELTER_INPUT_BUFFER_DURATION_MS\". Falling back to default value {DEFAULT_BUFFER_DURATION:?}."
+                );
+                DEFAULT_BUFFER_DURATION
+            }
+        },
+        Err(_) => DEFAULT_BUFFER_DURATION,
+    };
+
+    let side_channel_socket_dir = Some(read_side_channel_socket_dir());
+
+    let load_system_fonts = match env::var("SMELTER_LOAD_SYSTEM_FONTS") {
+        Ok(enable) => bool_env_from_str(&enable).unwrap_or(true),
+        Err(_) => true,
+    };
+
+    let whip_whep_server_port = match env::var("SMELTER_WHIP_WHEP_SERVER_PORT") {
+        Ok(whip_whep_port) => whip_whep_port
+            .parse::<u16>()
+            .map_err(|_| "SMELTER_WHIP_WHEP_SERVER_PORT has to be valid port number")?,
+        Err(_) => 9000,
+    };
+
+    let whip_whep_enable = match env::var("SMELTER_START_WHIP_WHEP_SERVER") {
+        Ok(enable) => bool_env_from_str(&enable).unwrap_or(true),
+        Err(_) => true,
+    };
+
+    let default_stun_servers = Arc::new(vec!["stun:stun.l.google.com:19302".to_string()]);
+    let webrtc_stun_servers =
+        match env::var("SMELTER_WEBRTC_STUN_SERVERS").or(env::var("SMELTER_STUN_SERVERS")) {
+            Ok(var) => {
+                if var.is_empty() {
+                    println!("CONFIG ERROR: empty stun servers env");
+                    Arc::new(Vec::new())
+                } else {
+                    Arc::new(var.split(',').map(String::from).collect())
+                }
+            }
+            Err(_) => default_stun_servers,
+        };
+
+    let webrtc_udp_port_range = match env::var("SMELTER_WEBRTC_UDP_PORT_RANGE") {
+        Ok(port_range) => match port_range_from_str(&port_range) {
+            Ok(port_range) => Some(port_range),
+            Err(err) => {
+                println!("CONFIG ERROR: \"{port_range}\" is not a valid port range: {err}");
+                None
+            }
+        },
+        Err(_) => None,
+    };
+
+    let webrtc_udp_mux_port = match env::var("SMELTER_WEBRTC_UDP_MUX_PORT") {
+        Ok(mux_port) => mux_port
+            .parse::<u16>()
+            .inspect_err(|err| {
+                println!(
+                    "CONFIG ERROR: SMELTER_WEBRTC_UDP_MUX_PORT has to be valid port number: {err}"
+                )
+            })
+            .ok(),
+        Err(_) => None,
+    };
+
+    let webrtc_udp_port_strategy = match (webrtc_udp_mux_port, webrtc_udp_port_range) {
+        (None, None) => None,
+        (None, Some((start, end))) => Some(WebrtcUdpPortStrategy::PortRange(start, end)),
+        (Some(port), None) => Some(WebrtcUdpPortStrategy::Mux(port)),
+        (Some(port), Some(_)) => {
+            println!(
+                "CONFIG ERROR: Options \"SMELTER_WEBRTC_UDP_MUX_PORT\" and \"SMELTER_WEBRTC_UDP_PORT_RANGE\" are conflicting. Ignoring \"SMELTER_WEBRTC_UDP_PORT_RANGE\""
+            );
+            Some(WebrtcUdpPortStrategy::Mux(port))
+        }
+    };
+
+    let webrtc_nat_1to1_ips = match env::var("SMELTER_WEBRTC_1_TO_1_NAT_IPS") {
+        Ok(ips) => Arc::new(ips.split(",").map(ToString::to_string).collect()),
+        Err(_) => Arc::new(vec![]),
+    };
+
+    let rtmp_server_port = match env::var("SMELTER_RTMP_SERVER_PORT") {
+        Ok(rtmp_port) => rtmp_port
+            .parse::<u16>()
+            .map_err(|_| "SMELTER_RTMP_SERVER_PORT has to be valid port number")?,
+        Err(_) => 1935,
+    };
+
+    let rtmp_enable = match env::var("SMELTER_START_RTMP_SERVER") {
+        Ok(enable) => bool_env_from_str(&enable).unwrap_or(true),
+        Err(_) => true,
+    };
+
+    let rtmp_tls_cert_file = match env::var("SMELTER_RTMP_TLS_CERT_FILE") {
+        Ok(path) => Some(Arc::from(path.as_str())),
+        Err(_) => None,
+    };
+    let rtmp_tls_key_file = match env::var("SMELTER_RTMP_TLS_KEY_FILE") {
+        Ok(path) => Some(Arc::from(path.as_str())),
+        Err(_) => None,
+    };
+
+    let rtmp_tls_config = match (rtmp_tls_cert_file, rtmp_tls_key_file) {
+        (Some(cert_file), Some(key_file)) => Some(TlsConfig {
+            cert_file,
+            key_file,
+        }),
+        _ => None,
+    };
+
+    let moq_server_port = match env::var("SMELTER_MOQ_SERVER_PORT") {
+        Ok(moq_port) => moq_port
+            .parse::<u16>()
+            .map_err(|_| "SMELTER_MOQ_SERVER_PORT has to be valid port number")?,
+        Err(_) => 4443,
+    };
+
+    let moq_tls_config = moq_server_tls_config();
+
+    let moq_enable_default = moq_tls_config.is_some();
+    let moq_enable = match env::var("SMELTER_START_MOQ_SERVER") {
+        Ok(enable) => bool_env_from_str(&enable).unwrap_or(moq_enable_default),
+        Err(_) => moq_enable_default,
+    };
+
+    let moq_disable_tls_verification = match env::var("SMELTER_MOQ_DISABLE_TLS_VERIFICATION") {
+        Ok(disable) => bool_env_from_str(&disable).unwrap_or(false),
+        Err(_) => false,
+    };
+
+    let log_file = match env::var("SMELTER_LOG_FILE") {
+        Ok(path) => Some(Arc::from(PathBuf::from(path))),
+        Err(_) => None,
+    };
+
+    let rendering_mode = match env::var("SMELTER_FORCE_CPU_OPTIMIZED_RENDERING_MODE") {
+        Ok(enable) => match bool_env_from_str(&enable) {
+            Some(true) => RenderingMode::CpuOptimized,
+            Some(false) | None => RenderingMode::GpuOptimized,
+        },
+        Err(_) => RenderingMode::GpuOptimized,
+    };
+
+    let render_max_layouts_count = match env::var("SMELTER_RENDER_MAX_LAYOUTS_COUNT") {
+        Ok(count) => match count.parse::<usize>() {
+            Ok(0) => {
+                println!("CONFIG ERROR: SMELTER_RENDER_MAX_LAYOUTS_COUNT has to be greater than 0");
+                DEFAULT_MAX_LAYOUTS_COUNT
+            }
+            Ok(count) => count,
+            Err(err) => {
+                println!(
+                    "CONFIG ERROR: SMELTER_RENDER_MAX_LAYOUTS_COUNT has to be a valid number: {err}"
+                );
+                DEFAULT_MAX_LAYOUTS_COUNT
+            }
+        },
+        Err(_) => DEFAULT_MAX_LAYOUTS_COUNT,
+    };
+
+    let config = Config {
+        instance_id,
+        api_port,
+        logger: LoggerConfig {
+            ffmpeg_logger_level,
+            format: logger_format,
+            stdio_level: stdio_logger_level,
+            file_level: file_logger_level,
+            log_file,
+        },
+        default_buffer_duration,
+        side_channel_socket_dir,
+        ahead_of_time_processing,
+        output_framerate,
+        run_late_scheduled_events,
+        never_drop_output_frames,
+        stale_frame_timeout,
+        web_renderer_enable,
+        web_renderer_gpu_enable,
+        download_root,
+        mixing_sample_rate,
+        wgpu_force_gpu,
+        wgpu_required_features,
+        gpu_device_id,
+        gpu_driver_name,
+        load_system_fonts,
+        whip_whep_enable,
+        whip_whep_server_port,
+        webrtc_stun_servers,
+        webrtc_udp_port_strategy,
+        webrtc_nat_1to1_ips,
+        rtmp_server_port,
+        rtmp_enable,
+        rtmp_tls_config,
+        moq_server_port,
+        moq_enable,
+        moq_tls_config,
+        moq_disable_tls_verification,
+        rendering_mode,
+        render_max_layouts_count,
+    };
+    Ok(config)
+}
+
+fn moq_server_tls_config() -> Option<moq_native::ServerTlsConfig> {
+    let moq_tls_cert_file = env::var("SMELTER_MOQ_TLS_CERT_FILE")
+        .ok()
+        .map(PathBuf::from);
+    let moq_tls_key_file = env::var("SMELTER_MOQ_TLS_KEY_FILE").ok().map(PathBuf::from);
+
+    match (moq_tls_cert_file, moq_tls_key_file) {
+        (Some(cert), Some(key)) => {
+            let mut tls = moq_native::ServerTlsConfig::default();
+            tls.cert = vec![cert];
+            tls.key = vec![key];
+            Some(tls)
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            println!(
+                "CONFIG ERROR: Both \"SMELTER_MOQ_TLS_CERT_FILE\" and \"SMELTER_MOQ_TLS_KEY_FILE\" must be set. Falling back to auto-generated certs. Make sure to use properly configured certs in production."
+            );
+            None
+        }
+        _ => {
+            // No cert/key configured. smelter-core will fall back to a persisted,
+            // insecure self-signed certificate (dev/test only) and log a warning
+            // with its SHA-256 fingerprint.
+            None
+        }
+    }
+}
+
+fn read_side_channel_socket_dir() -> Arc<Path> {
+    let dir = match env::var("SMELTER_SIDE_CHANNEL_SOCKET_DIR") {
+        Ok(path) => PathBuf::from(path),
+        Err(_) => {
+            let name = format!("smelter_side_channel_{}", rand::rng().random::<u64>());
+            // Prefer the XDG runtime dir when available. On macOS `env::temp_dir()`
+            // resolves to a per-user `/var/folders/...` path that is long enough to
+            // overflow the 104-byte `sun_path` limit once socket filenames are
+            // appended, so fall back to `/tmp` there instead.
+            let tmp_root = dirs::runtime_dir().unwrap_or_else(|| match cfg!(target_os = "macos") {
+                true => PathBuf::from("/tmp"),
+                false => env::temp_dir(),
+            });
+            tmp_root.join(name)
+        }
+    };
+    Arc::from(dir)
+}
+
+fn framerate_from_str(s: &str) -> Result<Framerate, &'static str> {
+    const ERROR_MESSAGE: &str = "Framerate needs to be an unsigned integer or a string in the \"NUM/DEN\" format, where NUM and DEN are both unsigned integers.";
+    if s.contains('/') {
+        let Some((num_str, den_str)) = s.split_once('/') else {
+            return Err(ERROR_MESSAGE);
+        };
+        let num = num_str.parse::<u32>().map_err(|_| ERROR_MESSAGE)?;
+        let den = den_str.parse::<u32>().map_err(|_| ERROR_MESSAGE)?;
+        Ok(smelter_render::Framerate { num, den })
+    } else {
+        Ok(smelter_render::Framerate {
+            num: s.parse::<u32>().map_err(|_| ERROR_MESSAGE)?,
+            den: 1,
+        })
+    }
+}
+
+fn port_range_from_str(s: &str) -> Result<(u16, u16), &'static str> {
+    const ERROR_MESSAGE: &str =
+        "Port range needs to be in the \"START:END\" format, where START < END.";
+    let Some((num_str, den_str)) = s.split_once(':') else {
+        return Err(ERROR_MESSAGE);
+    };
+    let start = num_str.parse::<u16>().map_err(|_| ERROR_MESSAGE)?;
+    let end = den_str.parse::<u16>().map_err(|_| ERROR_MESSAGE)?;
+    Ok((start, end))
+}
+
+fn bool_env_from_str(s: &str) -> Option<bool> {
+    match s {
+        "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn wgpu_features_from_str(s: &str) -> Result<WgpuFeatures, String> {
+    let mut all_features = WgpuFeatures::default();
+    for feature in s.split(',') {
+        let feature = match feature {
+            "SHADER_FLOAT32_ATOMIC" => WgpuFeatures::SHADER_FLOAT32_ATOMIC,
+            "TEXTURE_FORMAT_16BIT_NORM" => WgpuFeatures::TEXTURE_FORMAT_16BIT_NORM,
+            "TEXTURE_COMPRESSION_ASTC_HDR" => WgpuFeatures::TEXTURE_COMPRESSION_ASTC_HDR,
+            "TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES" => {
+                WgpuFeatures::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+            }
+            "PIPELINE_STATISTICS_QUERY" => WgpuFeatures::PIPELINE_STATISTICS_QUERY,
+            "TIMESTAMP_QUERY_INSIDE_ENCODERS" => WgpuFeatures::TIMESTAMP_QUERY_INSIDE_ENCODERS,
+            "TIMESTAMP_QUERY_INSIDE_PASSES" => WgpuFeatures::TIMESTAMP_QUERY_INSIDE_PASSES,
+            "MAPPABLE_PRIMARY_BUFFERS" => WgpuFeatures::MAPPABLE_PRIMARY_BUFFERS,
+            "TEXTURE_BINDING_ARRAY" => WgpuFeatures::TEXTURE_BINDING_ARRAY,
+            "BUFFER_BINDING_ARRAY" => WgpuFeatures::BUFFER_BINDING_ARRAY,
+            "STORAGE_RESOURCE_BINDING_ARRAY" => WgpuFeatures::STORAGE_RESOURCE_BINDING_ARRAY,
+            "SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING" => {
+                WgpuFeatures::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING
+            }
+            "STORAGE_TEXTURE_ARRAY_NON_UNIFORM_INDEXING" => {
+                WgpuFeatures::STORAGE_TEXTURE_ARRAY_NON_UNIFORM_INDEXING
+            }
+            "PARTIALLY_BOUND_BINDING_ARRAY" => WgpuFeatures::PARTIALLY_BOUND_BINDING_ARRAY,
+            "MULTI_DRAW_INDIRECT_COUNT" => WgpuFeatures::MULTI_DRAW_INDIRECT_COUNT,
+            "ADDRESS_MODE_CLAMP_TO_ZERO" => WgpuFeatures::ADDRESS_MODE_CLAMP_TO_ZERO,
+            "ADDRESS_MODE_CLAMP_TO_BORDER" => WgpuFeatures::ADDRESS_MODE_CLAMP_TO_BORDER,
+            "POLYGON_MODE_LINE" => WgpuFeatures::POLYGON_MODE_LINE,
+            "POLYGON_MODE_POINT" => WgpuFeatures::POLYGON_MODE_POINT,
+            "CONSERVATIVE_RASTERIZATION" => WgpuFeatures::CONSERVATIVE_RASTERIZATION,
+            "VERTEX_WRITABLE_STORAGE" => WgpuFeatures::VERTEX_WRITABLE_STORAGE,
+            "CLEAR_TEXTURE" => WgpuFeatures::CLEAR_TEXTURE,
+            "MULTIVIEW" => WgpuFeatures::MULTIVIEW,
+            "VERTEX_ATTRIBUTE_64BIT" => WgpuFeatures::VERTEX_ATTRIBUTE_64BIT,
+            "TEXTURE_ATOMIC" => WgpuFeatures::TEXTURE_ATOMIC,
+            "TEXTURE_FORMAT_NV12" => WgpuFeatures::TEXTURE_FORMAT_NV12,
+            "TEXTURE_FORMAT_P010" => WgpuFeatures::TEXTURE_FORMAT_P010,
+            "EXTERNAL_TEXTURE" => WgpuFeatures::EXTERNAL_TEXTURE,
+            "EXPERIMENTAL_RAY_QUERY" => WgpuFeatures::EXPERIMENTAL_RAY_QUERY,
+            "SHADER_F64" => WgpuFeatures::SHADER_F64,
+            "SHADER_I16" => WgpuFeatures::SHADER_I16,
+            "PRIMITIVE_INDEX" => WgpuFeatures::PRIMITIVE_INDEX,
+            "SHADER_EARLY_DEPTH_TEST" => WgpuFeatures::SHADER_EARLY_DEPTH_TEST,
+            "SHADER_INT64" => WgpuFeatures::SHADER_INT64,
+            "SUBGROUP" => WgpuFeatures::SUBGROUP,
+            "SUBGROUP_VERTEX" => WgpuFeatures::SUBGROUP_VERTEX,
+            "SUBGROUP_BARRIER" => WgpuFeatures::SUBGROUP_BARRIER,
+            "PIPELINE_CACHE" => WgpuFeatures::PIPELINE_CACHE,
+            "SHADER_INT64_ATOMIC_MIN_MAX" => WgpuFeatures::SHADER_INT64_ATOMIC_MIN_MAX,
+            "SHADER_INT64_ATOMIC_ALL_OPS" => WgpuFeatures::SHADER_INT64_ATOMIC_ALL_OPS,
+            "VULKAN_GOOGLE_DISPLAY_TIMING" => WgpuFeatures::VULKAN_GOOGLE_DISPLAY_TIMING,
+            "VULKAN_EXTERNAL_MEMORY_WIN32" => WgpuFeatures::VULKAN_EXTERNAL_MEMORY_WIN32,
+            "TEXTURE_INT64_ATOMIC" => WgpuFeatures::TEXTURE_INT64_ATOMIC,
+            "UNIFORM_BUFFER_BINDING_ARRAYS" => WgpuFeatures::UNIFORM_BUFFER_BINDING_ARRAYS,
+            "EXPERIMENTAL_MESH_SHADER" => WgpuFeatures::EXPERIMENTAL_MESH_SHADER,
+            "EXPERIMENTAL_RAY_HIT_VERTEX_RETURN" => {
+                WgpuFeatures::EXPERIMENTAL_RAY_HIT_VERTEX_RETURN
+            }
+            "EXPERIMENTAL_MESH_SHADER_MULTIVIEW" => {
+                WgpuFeatures::EXPERIMENTAL_MESH_SHADER_MULTIVIEW
+            }
+            "EXTENDED_ACCELERATION_STRUCTURE_VERTEX_FORMATS" => {
+                WgpuFeatures::EXTENDED_ACCELERATION_STRUCTURE_VERTEX_FORMATS
+            }
+            "PASSTHROUGH_SHADERS" => WgpuFeatures::PASSTHROUGH_SHADERS,
+            "SHADER_BARYCENTRICS" => WgpuFeatures::SHADER_BARYCENTRICS,
+            "SELECTIVE_MULTIVIEW" => WgpuFeatures::SELECTIVE_MULTIVIEW,
+            "EXPERIMENTAL_MESH_SHADER_POINTS" => WgpuFeatures::EXPERIMENTAL_MESH_SHADER_POINTS,
+            "MULTISAMPLE_ARRAY" => WgpuFeatures::MULTISAMPLE_ARRAY,
+            "DEPTH_CLIP_CONTROL" => WgpuFeatures::DEPTH_CLIP_CONTROL,
+            "DEPTH32FLOAT_STENCIL8" => WgpuFeatures::DEPTH32FLOAT_STENCIL8,
+            "TEXTURE_COMPRESSION_BC" => WgpuFeatures::TEXTURE_COMPRESSION_BC,
+            "TEXTURE_COMPRESSION_BC_SLICED_3D" => WgpuFeatures::TEXTURE_COMPRESSION_BC_SLICED_3D,
+            "TEXTURE_COMPRESSION_ETC2" => WgpuFeatures::TEXTURE_COMPRESSION_ETC2,
+            "TEXTURE_COMPRESSION_ASTC" => WgpuFeatures::TEXTURE_COMPRESSION_ASTC,
+            "TEXTURE_COMPRESSION_ASTC_SLICED_3D" => {
+                WgpuFeatures::TEXTURE_COMPRESSION_ASTC_SLICED_3D
+            }
+            "TIMESTAMP_QUERY" => WgpuFeatures::TIMESTAMP_QUERY,
+            "INDIRECT_FIRST_INSTANCE" => WgpuFeatures::INDIRECT_FIRST_INSTANCE,
+            "SHADER_F16" => WgpuFeatures::SHADER_F16,
+            "RG11B10UFLOAT_RENDERABLE" => WgpuFeatures::RG11B10UFLOAT_RENDERABLE,
+            "BGRA8UNORM_STORAGE" => WgpuFeatures::BGRA8UNORM_STORAGE,
+            "FLOAT32_FILTERABLE" => WgpuFeatures::FLOAT32_FILTERABLE,
+            "DUAL_SOURCE_BLENDING" => WgpuFeatures::DUAL_SOURCE_BLENDING,
+            "CLIP_DISTANCES" => WgpuFeatures::CLIP_DISTANCES,
+            "IMMEDIATES" => WgpuFeatures::IMMEDIATES,
+            "" => WgpuFeatures::default(),
+            feature => {
+                return Err(format!("Unknown wgpu feature \"{feature}\""));
+            }
+        };
+        all_features.set(feature, true)
+    }
+    Ok(all_features)
+}

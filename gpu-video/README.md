@@ -1,0 +1,196 @@
+# gpu-video
+
+A library for hardware video decoding and encoding, with [wgpu] integration.
+
+[![Crates.io][crates-badge]][crates-url]
+[![docs.rs][docs-badge]][docs-url]
+[![MIT licensed][mit-badge]][mit-url]
+
+[crates-badge]: https://img.shields.io/crates/v/gpu-video
+[crates-url]: https://crates.io/crates/gpu-video
+[mit-badge]: https://img.shields.io/badge/license-MIT-blue.svg
+[mit-url]: https://github.com/software-mansion/smelter/blob/master/gpu-video/LICENSE
+[docs-badge]: https://img.shields.io/docsrs/gpu-video
+[docs-url]: https://docs.rs/gpu-video/latest/gpu_video/
+
+## Overview
+
+The goal of this library is to provide easy access to hardware video coding. You can use it to decode and encode a video frame to/from `Vec<u8>` with pixel data, or straight to/from GPU textures through [wgpu]. Currently, we support the following codecs:
+
+|            | Decode | Encode |
+|:----------:|:------:|:------:|
+| H.264/AVC  | ✅      | ✅      |
+| H.265/HEVC | ❌      | ✅      |
+| AV1        | ❌      | 🚧     |
+
+- ✅ - should work, file issues if there are problems
+- 🚧 - working on this currently
+- ❌ - not supported yet, but support is planned
+
+An advantage of using this library with wgpu is that decoded video frames never leave the GPU memory. There's no copying the frames to RAM and back to the GPU, so it should be quite fast if you want to use them for rendering.
+
+Frames are passed around as a `VideoTexture`, a thin wrapper over the [`wgpu::Texture`]s holding the NV12 planes. It hands out plain texture views and copy descriptors for each plane, so it plugs into bind groups, render passes and copies like any other wgpu texture.
+
+This library was developed as a part of [smelter, a tool for video composition](https://smelter.dev/).
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/software-mansion/smelter/f70f6087d53ec046824c0c41dc8a64a19bd943cf/tools/assets/smelter-logo-transparent.svg">
+  <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/software-mansion/smelter/f70f6087d53ec046824c0c41dc8a64a19bd943cf/tools/assets/smelter-logo-background.svg">
+  <img height="60" alt="Smelter" src="https://raw.githubusercontent.com/software-mansion/smelter/f70f6087d53ec046824c0c41dc8a64a19bd943cf/tools/assets/smelter-logo-background.svg">
+</picture>
+
+## Code samples
+
+### Decode video frames into wgpu textures
+
+```rust
+async fn decode_video(
+    mut encoded_video_reader: impl std::io::Read,
+) {
+    use gpu_video::{VideoAdapterExt, VideoDeviceExt, parameters::VideoDeviceDescriptor};
+
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = instance
+        .enumerate_adapters(wgpu::Backends::VULKAN)
+        .await
+        .into_iter()
+        .find(|a| {
+            a.video_adapter_info()
+                .is_some_and(|info| info.decode_capabilities.h264.is_some())
+        })
+        .unwrap();
+    let (device, queue) = adapter
+        .request_device_with_video_support(&VideoDeviceDescriptor::default())
+        .unwrap();
+    let video_device = device.video().unwrap();
+
+    let mut decoder = video_device.create_wgpu_textures_decoder_h264(
+        &queue,
+        gpu_video::parameters::DecoderParameters::default(),
+        |_frame| {
+            // Each frame is a VideoTexture: wgpu textures with NV12 planes you can sample for drawing.
+            // Keep this callback light, e.g. pass the frame through a channel.
+        },
+    ).unwrap();
+
+    let mut buffer = vec![0; 4096];
+
+    while let Ok(n) = encoded_video_reader.read(&mut buffer) {
+        if n == 0 {
+            break;
+        }
+
+        decoder.decode(gpu_video::EncodedInputChunk {
+            data: &buffer[..n],
+            pts: None
+        }).unwrap();
+    }
+
+    decoder.flush().unwrap();
+}
+```
+
+### Encode video frames from wgpu textures
+
+```rust
+async fn encode_video(
+    frame_receiver: std::sync::mpsc::Receiver<gpu_video::VideoTexture>,
+) {
+    use std::num::NonZeroU32;
+    use gpu_video::{VideoAdapterExt, VideoDeviceExt, parameters::VideoDeviceDescriptor};
+
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = instance
+        .enumerate_adapters(wgpu::Backends::VULKAN)
+        .await
+        .into_iter()
+        .find(|a| {
+            a.video_adapter_info()
+                .is_some_and(|info| info.encode_capabilities.h264.is_some())
+        })
+        .unwrap();
+    let (device, queue) = adapter
+        .request_device_with_video_support(&VideoDeviceDescriptor::default())
+        .unwrap();
+    let video_device = device.video().unwrap();
+    let encoder_parameters = gpu_video::parameters::EncoderParametersH264 {
+        output_parameters: video_device
+            .encoder_output_parameters_h264_high_quality(
+                gpu_video::parameters::RateControl::VariableBitrate {
+                    average_bitrate: 500_000,
+                    max_bitrate: 2_000_000,
+                    virtual_buffer_size: std::time::Duration::from_secs(2),
+                },
+            )
+            .unwrap(),
+        input_parameters: gpu_video::parameters::VideoParameters {
+            width: NonZeroU32::new(1920).unwrap(),
+            height: NonZeroU32::new(1080).unwrap(),
+            target_framerate: 30.into(),
+        },
+        max_in_flight_submissions: None,
+    };
+
+    let mut encoder = video_device
+        .create_wgpu_textures_encoder_h264(
+            &queue,
+            encoder_parameters,
+            // callback used for passing the encoded frames
+            move |chunk| {
+                // ...
+            }
+        )
+        .unwrap();
+
+    for frame in frame_receiver.iter() {
+        // NV12 frame is copied to the encoder's input texture.
+        let input_texture = encoder.input_texture().unwrap();
+        let mut command_encoder = device.create_command_encoder(&Default::default());
+        frame.copy_to(&mut command_encoder, input_texture.texture());
+        queue.submit([command_encoder.finish()]);
+
+        encoder
+            .encode(
+                gpu_video::InputFrame {
+                    data: input_texture,
+                    pts: None,
+                },
+                false,
+            )
+            .unwrap();
+    }
+}
+```
+
+Be sure to check out our examples, especially the `player` example, which is a simple video player built using this library and wgpu. Because the player is very simple, you need to extract the raw h264 data from a container before usage. Here's an example on how to extract the h264 bytestream out of an mp4 file using ffmpeg:
+
+```sh
+ffmpeg -i input.mp4 -c:v copy -bsf:v h264_mp4toannexb -an output.h264
+```
+
+Then you can run the example with:
+
+```sh
+git clone https://github.com/software-mansion/smelter.git
+cd smelter/gpu-video
+cargo run --example player -- output.h264 FRAMERATE
+```
+
+## Compatibility
+
+On Linux, the library should work on NVIDIA and AMD GPUs out of the box with recent Mesa drivers. For AMD GPUs with a bit older Mesa drivers, you may need to set the `RADV_PERFTEST=video_decode,video_encode` environment variable:
+
+```sh
+RADV_PERFTEST=video_decode,video_encode cargo run
+```
+
+It should work on Windows with recent drivers out of the box. Be sure to submit an issue if it doesn't.
+
+[wgpu]: https://wgpu.rs/
+[`wgpu::Texture`]: https://docs.rs/wgpu/latest/wgpu/struct.Texture.html
+
+## gpu-video is created by Software Mansion
+
+<a href="https://swmansion.com"><img width="150" height="80" alt="Software Mansion" src="https://github.com/user-attachments/assets/cacd6185-78b0-4e76-8767-016d6389bb2b" /></a>
+
+Since 2012 [Software Mansion](https://swmansion.com) is a software agency with experience in building web and mobile apps as well as complex multimedia solutions. We are Core React Native Contributors and experts in live streaming and broadcasting technologies. We can help you build your next dream product – [Hire us](https://swmansion.com/contact/projects?utm_source=smelter-gpu-video&utm_medium=readme).

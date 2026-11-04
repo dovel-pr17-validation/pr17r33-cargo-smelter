@@ -1,0 +1,11 @@
+/examples/encoded_channel_output_dump.opus
+/examples/encoded_channel_output_dump.h264
+/examples/raw_channel_output_audio_dump.debug
+/examples/raw_channel_output_video_frame_*.png
+/examples/assets/image.png
+/examples/demo/*.json
+/test_workdir
+
+/moq_relay_config.toml
+/moq_key.jwk
+/moq_token.jwt

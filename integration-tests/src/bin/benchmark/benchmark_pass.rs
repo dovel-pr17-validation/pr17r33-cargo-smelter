@@ -1,0 +1,458 @@
+use anyhow::{Result, anyhow};
+use crossbeam_channel::{Receiver, Sender, TryRecvError};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
+};
+
+use smelter_core::{
+    codecs::*,
+    error::{RegisterInputError, RegisterOutputError},
+    graphics_context::GraphicsContext,
+    protocols::*,
+    *,
+};
+use smelter_render::{
+    InputId, OutputId, RendererId, RendererSpec, RenderingMode, YuvPlanes, scene::Component,
+};
+use tracing::debug;
+
+use crate::{
+    args::{EncoderPreset, Resolution},
+    benchmark::EncoderOptions,
+    scenes::{BuilderFn, SceneContext},
+    utils::benchmark_pipeline_options,
+};
+
+const KEYFRAME_INTERVAL: Duration = Duration::from_millis(5000);
+
+#[derive(Debug, Clone)]
+pub struct InputFile {
+    pub label: &'static str,
+    pub kind: InputFileKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum InputFileKind {
+    Mp4(PathBuf),
+    Raw(RawInputFile),
+}
+
+#[derive(Clone)]
+pub struct RawInputFile {
+    pub frames: Arc<Vec<YuvPlanes>>,
+    pub resolution: Resolution,
+    pub framerate: f64,
+}
+
+impl fmt::Debug for RawInputFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RawInputFile").finish()
+    }
+}
+
+trait DurationReceiver {
+    fn try_receive(&self) -> Result<Timestamp, TryRecvError>;
+}
+
+impl DurationReceiver for Receiver<PipelineEvent<Frame>> {
+    fn try_receive(&self) -> Result<Timestamp, TryRecvError> {
+        loop {
+            match self.try_recv() {
+                Ok(PipelineEvent::EOS) => (),
+                Ok(PipelineEvent::Data(frame)) => return Ok(frame.pts),
+                Err(err) => return Err(err),
+            }
+        }
+    }
+}
+
+impl DurationReceiver for Receiver<EncodedOutputEvent> {
+    fn try_receive(&self) -> Result<Timestamp, TryRecvError> {
+        loop {
+            match self.try_recv() {
+                Ok(EncodedOutputEvent::AudioEOS) => (),
+                Ok(EncodedOutputEvent::VideoEOS) => (),
+                Ok(EncodedOutputEvent::Data(chunk)) => match chunk.kind {
+                    MediaKind::Video(_) => return Ok(chunk.pts),
+                    MediaKind::Audio(_) => (),
+                },
+                Err(err) => return Err(err),
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SingleBenchmarkPass {
+    pub builder: BuilderFn,
+    pub resources: Vec<(RendererId, RendererSpec)>,
+    pub input_count: u64,
+    pub output_count: u64,
+    pub framerate: u64,
+    pub input_file: InputFile,
+    pub output_resolution: Resolution,
+    pub encoder: EncoderOptions,
+    pub warm_up_time: Duration,
+    pub decoder: VideoDecoderOptions,
+    pub rendering_mode: RenderingMode,
+}
+
+impl SingleBenchmarkPass {
+    pub fn run(&self, ctx: GraphicsContext) -> Result<bool> {
+        let pipeline = Pipeline::new(benchmark_pipeline_options(
+            self.framerate,
+            ctx,
+            self.rendering_mode,
+        ))?;
+
+        let pipeline = Arc::new(Mutex::new(pipeline));
+
+        debug!("pipeline start");
+        Pipeline::start(&pipeline);
+
+        let inputs: Vec<_> = (0..self.input_count)
+            .map(|i| InputId(format!("input_{i}").into()))
+            .collect();
+        let outputs: Vec<_> = (0..self.output_count)
+            .map(|i| OutputId(format!("output_{i}").into()))
+            .collect();
+
+        match self.input_file.kind.clone() {
+            InputFileKind::Raw(input) => {
+                let frame_senders = inputs
+                    .iter()
+                    .cloned()
+                    .map(|input_id| Ok(self.register_pipeline_raw_input(&pipeline, input_id)?))
+                    .collect::<Result<Vec<_>>>()?;
+                thread::spawn(move || raw_data_sender(frame_senders, input));
+            }
+            InputFileKind::Mp4(path) => {
+                for input_id in &inputs {
+                    self.register_pipeline_mp4_input(&pipeline, input_id, &path)?;
+                }
+            }
+        };
+
+        let scene_ctx = SceneContext {
+            inputs: inputs.clone(),
+            outputs: outputs.clone(),
+        };
+        for (id, spec) in self.resources.clone() {
+            Pipeline::register_renderer(&pipeline, id, spec)?;
+        }
+        let receivers = outputs
+            .iter()
+            .map(|output_id| {
+                let (root, audio_mix) = (self.builder)(&scene_ctx, output_id);
+                let receiver: Box<dyn DurationReceiver + Send> = match self.encoder {
+                    EncoderOptions::Disabled => {
+                        self.register_pipeline_raw_output(&pipeline, output_id, root, audio_mix)?
+                    }
+                    EncoderOptions::FfmpegH264(preset) => self
+                        .register_pipeline_encoded_output_ffmpeg(
+                            &pipeline, output_id, root, audio_mix, preset,
+                        )?,
+
+                    EncoderOptions::VulkanH264 => self.register_pipeline_encoded_output_vulkan(
+                        &pipeline, output_id, root, audio_mix,
+                    )?,
+                };
+
+                Ok(receiver)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let start_time = Instant::now();
+        let output_threads: Vec<_> = receivers
+            .into_iter()
+            .map(|receiver| self.listen_on_output(start_time, receiver))
+            .collect();
+
+        debug!("waiting for results");
+        let mut result = true;
+        for output_thread in output_threads {
+            if !output_thread.join().map_err(|_| anyhow!("thread panic"))? {
+                result = false;
+            }
+        }
+        Ok(result)
+    }
+
+    fn register_pipeline_encoded_output_ffmpeg(
+        &self,
+        pipeline: &Arc<Mutex<Pipeline>>,
+        output_id: &OutputId,
+        root: Component,
+        audio_mix: AudioMixerConfig,
+        preset: EncoderPreset,
+    ) -> Result<Box<dyn DurationReceiver + Send>, RegisterOutputError> {
+        let result = Pipeline::register_encoded_data_output(
+            pipeline,
+            output_id.clone(),
+            RegisterEncodedDataOutputOptions {
+                video: Some(RegisterOutputVideoOptions {
+                    initial: root,
+                    end_condition: PipelineOutputEndCondition::Never,
+                }),
+                audio: Some(audio_output_options(audio_mix)),
+                output_options: EncodedDataOutputOptions {
+                    audio: Some(default_audio_encoder()),
+                    video: Some(VideoEncoderOptions::FfmpegH264(FfmpegH264EncoderOptions {
+                        encoder_name: None,
+                        bitrate: None,
+                        keyframe_interval: KEYFRAME_INTERVAL,
+                        resolution: smelter_render::Resolution {
+                            width: self.output_resolution.width,
+                            height: self.output_resolution.height,
+                        },
+                        pixel_format: OutputPixelFormat::YUV420P,
+                        raw_options: vec![
+                            ("threads".into(), "0".into()),
+                            ("preset".into(), preset.as_str().into()),
+                        ],
+                        bitstream_format: H264BitstreamFormat::AnnexB,
+                        low_latency: false,
+                    })),
+                },
+            },
+        )?;
+        Ok(Box::new(result.receiver))
+    }
+
+    fn register_pipeline_encoded_output_vulkan(
+        &self,
+        pipeline: &Arc<Mutex<Pipeline>>,
+        output_id: &OutputId,
+        root: Component,
+        audio_mix: AudioMixerConfig,
+    ) -> Result<Box<dyn DurationReceiver + Send>, RegisterOutputError> {
+        let result = Pipeline::register_encoded_data_output(
+            pipeline,
+            output_id.clone(),
+            RegisterEncodedDataOutputOptions {
+                video: Some(RegisterOutputVideoOptions {
+                    initial: root,
+                    end_condition: PipelineOutputEndCondition::Never,
+                }),
+                audio: Some(audio_output_options(audio_mix)),
+                output_options: EncodedDataOutputOptions {
+                    audio: Some(default_audio_encoder()),
+                    video: Some(VideoEncoderOptions::VulkanH264(VulkanH264EncoderOptions {
+                        resolution: smelter_render::Resolution {
+                            width: self.output_resolution.width,
+                            height: self.output_resolution.height,
+                        },
+                        bitrate: None,
+                        preset: VulkanH264EncoderPreset::HighQuality,
+                        keyframe_interval: KEYFRAME_INTERVAL,
+                        bitstream_format: H264BitstreamFormat::AnnexB,
+                    })),
+                },
+            },
+        )?;
+        Ok(Box::new(result.receiver))
+    }
+
+    fn register_pipeline_raw_output(
+        &self,
+        pipeline: &Arc<Mutex<Pipeline>>,
+        output_id: &OutputId,
+        root: Component,
+        audio_mix: AudioMixerConfig,
+    ) -> Result<Box<dyn DurationReceiver + Send>, RegisterOutputError> {
+        let result = Pipeline::register_raw_data_output(
+            pipeline,
+            output_id.clone(),
+            RegisterRawDataOutputOptions {
+                video: Some(RegisterOutputVideoOptions {
+                    initial: root,
+                    end_condition: PipelineOutputEndCondition::Never,
+                }),
+                audio: Some(audio_output_options(audio_mix)),
+                output_options: RawDataOutputOptions {
+                    audio: Some(RawDataOutputAudioOptions),
+                    video: Some(RawDataOutputVideoOptions {
+                        resolution: smelter_render::Resolution {
+                            width: self.output_resolution.width,
+                            height: self.output_resolution.height,
+                        },
+                    }),
+                },
+            },
+        )?;
+        Ok(Box::new(result.video.unwrap()))
+    }
+
+    fn register_pipeline_mp4_input(
+        &self,
+        pipeline: &Arc<Mutex<Pipeline>>,
+        input_id: &InputId,
+        path: &Path,
+    ) -> Result<InputInitInfo, RegisterInputError> {
+        Pipeline::register_input(
+            pipeline,
+            input_id.clone(),
+            RegisterInputOptions::Mp4(Mp4InputOptions {
+                should_loop: true,
+                video_decoders: Mp4InputVideoDecoders {
+                    h264: Some(self.decoder),
+                },
+                source: Mp4InputSource::File(path.to_path_buf().into()),
+                seek: None,
+                offset: None,
+                queue_options: QueueInputOptions {
+                    required: true,
+                    ..Default::default()
+                },
+            }),
+        )
+    }
+
+    fn register_pipeline_raw_input(
+        &self,
+        pipeline: &Arc<Mutex<Pipeline>>,
+        input_id: InputId,
+    ) -> Result<Sender<Frame>, RegisterInputError> {
+        let input = Pipeline::register_raw_data_input(
+            pipeline,
+            input_id,
+            RawDataInputOptions {
+                video: true,
+                audio: false,
+                required: true,
+                offset: QueueTrackOffset::None,
+            },
+        )?;
+
+        Ok(input.video.unwrap())
+    }
+
+    fn listen_on_output(
+        &self,
+        start_time: Instant,
+        receiver: Box<dyn DurationReceiver + Send>,
+    ) -> thread::JoinHandle<bool> {
+        let warm_up_time = self.warm_up_time;
+        debug!("start listening for output frames");
+        thread::spawn(move || {
+            debug!("start drain in warm up mode");
+            while start_time.elapsed() < warm_up_time {
+                if let Err(TryRecvError::Empty) = receiver.try_receive() {
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+
+            const FIRST_CHECK: Timestamp = Timestamp::from_secs(6);
+            const SECOND_CHECK: Timestamp = Timestamp::from_secs(12);
+            const LAST_CHECK: Timestamp = Timestamp::from_secs(30);
+
+            debug!("start drain in measure mode");
+            let mut max_pts: Timestamp = Timestamp::ZERO;
+            let mut min_pts: Timestamp = Timestamp::MAX;
+            let receive_fn = move |min_pts: &mut Timestamp, max_pts: &mut Timestamp| match receiver
+                .try_receive()
+            {
+                Err(TryRecvError::Empty) => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(TryRecvError::Disconnected) => panic!(),
+                Ok(pts) => {
+                    *max_pts = (*max_pts).max(pts);
+                    *min_pts = (*min_pts).min(pts);
+                }
+            };
+
+            // First check after 6 second
+            while start_time.timestamp_now() < FIRST_CHECK + warm_up_time {
+                receive_fn(&mut min_pts, &mut max_pts)
+            }
+            let measured_time = max_pts - min_pts;
+            if measured_time < FIRST_CHECK - Duration::from_millis(1200) {
+                debug!("FAIL first check - {:?}", measured_time);
+                return false;
+            } else if measured_time > FIRST_CHECK - Duration::from_millis(50) {
+                debug!("PASS first check - {:?}", measured_time);
+                return true;
+            } else {
+                debug!("continue check - {:?}", measured_time);
+            }
+
+            // Second check after 12 second
+            while start_time.timestamp_now() < SECOND_CHECK + warm_up_time {
+                receive_fn(&mut min_pts, &mut max_pts)
+            }
+            let measured_time = max_pts - min_pts;
+            if measured_time < SECOND_CHECK - Duration::from_millis(800) {
+                debug!("FAIL second check - {:?}", measured_time);
+                return false;
+            } else if measured_time > SECOND_CHECK - Duration::from_millis(100) {
+                debug!("PASS second check - {:?}", measured_time);
+                return true;
+            } else {
+                debug!("continue check - {:?}", measured_time);
+            }
+
+            // Last check
+            while start_time.timestamp_now() < LAST_CHECK + warm_up_time {
+                receive_fn(&mut min_pts, &mut max_pts)
+            }
+            let measured_time = max_pts - min_pts;
+            if measured_time > LAST_CHECK - Duration::from_millis(800) {
+                debug!("PASS last check - {:?}", measured_time);
+                true
+            } else {
+                debug!("FAIL last check - {:?}", measured_time);
+                false
+            }
+        })
+    }
+}
+
+fn audio_output_options(mix: AudioMixerConfig) -> RegisterOutputAudioOptions {
+    RegisterOutputAudioOptions {
+        initial: mix,
+        mixing_strategy: AudioMixingStrategy::SumClip,
+        channels: AudioChannels::Stereo,
+        end_condition: PipelineOutputEndCondition::Never,
+    }
+}
+
+fn default_audio_encoder() -> AudioEncoderOptions {
+    AudioEncoderOptions::FdkAac(FdkAacEncoderOptions {
+        channels: AudioChannels::Stereo,
+        sample_rate: 48_000,
+        bitstream_format: AacBitstreamFormat::Raw,
+    })
+}
+
+fn raw_data_sender(senders: Vec<Sender<Frame>>, input: RawInputFile) {
+    if senders.is_empty() {
+        return;
+    }
+
+    let mut counter: u64 = 0;
+    loop {
+        for yuv_planes in input.frames.iter() {
+            let frame = Frame {
+                data: smelter_render::FrameData::PlanarYuv420(yuv_planes.clone()),
+                resolution: smelter_render::Resolution {
+                    width: input.resolution.width,
+                    height: input.resolution.height,
+                },
+                pts: Timestamp::from_secs_f64(counter as f64 / input.framerate),
+            };
+            counter += 1;
+
+            for sender in &senders {
+                if sender.send(frame.clone()).is_err() {
+                    debug!("Stopping raw data sender");
+                    return;
+                }
+            }
+        }
+    }
+}

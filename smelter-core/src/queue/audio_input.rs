@@ -1,0 +1,351 @@
+use std::{collections::VecDeque, sync::Arc, time::Duration};
+
+use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
+use smelter_render::InputId;
+use tracing::{debug, trace, warn};
+
+use crate::{
+    Ref,
+    event::{Event, EventEmitter},
+    queue::{
+        QueueAudioSamples, QueueContext, queue_input::TrackOffset, side_channel::AudioSideChannel,
+        utils::EmitOnceGuard,
+    },
+};
+
+use crate::prelude::*;
+
+const MIXER_STRETCH_BUFFER: Duration = Duration::from_millis(80);
+
+pub(crate) struct AudioQueueInput {
+    queue_ctx: QueueContext,
+    /// Samples from the channel might have any PTS, they need to be processed
+    /// before adding them to the `queue`.
+    receiver: AudioInputReceiver,
+    /// If stream is required the queue should wait for frames. For optional
+    /// inputs a queue will wait only as long as a buffer allows.
+    required: bool,
+    /// Offset of the stream relative to the start. If set to `None`
+    /// offset will be resolved automatically on the stream start.
+    offset_from_start: Option<Duration>,
+
+    track_offset: TrackOffset,
+
+    paused: bool,
+
+    event_delivered_guard: EmitOnceGuard,
+    event_playing_guard: EmitOnceGuard,
+    event_eos_guard: EmitOnceGuard,
+    event_emitter: Arc<EventEmitter>,
+    input_id: InputId,
+}
+
+impl AudioQueueInput {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
+        queue_ctx: &QueueContext,
+        event_emitter: &Arc<EventEmitter>,
+        input_ref: &Ref<InputId>,
+        required: bool,
+        offset: Option<Duration>,
+        track_offset: TrackOffset,
+        side_channel: Option<AudioSideChannel>,
+        side_channel_delay: Duration,
+    ) -> (Self, Sender<InputAudioSamples>) {
+        let (receiver, sender) = AudioInputReceiver::new(side_channel_delay, side_channel);
+        let input = Self {
+            queue_ctx: queue_ctx.clone(),
+            required,
+            offset_from_start: offset,
+            receiver,
+            track_offset,
+            paused: false,
+            event_delivered_guard: EmitOnceGuard::new(
+                Event::AudioInputStreamDelivered(input_ref.id().clone()),
+                event_emitter,
+            ),
+            event_playing_guard: EmitOnceGuard::new(
+                Event::AudioInputStreamPlaying(input_ref.id().clone()),
+                event_emitter,
+            ),
+            event_eos_guard: EmitOnceGuard::new(
+                Event::AudioInputStreamEos(input_ref.id().clone()),
+                event_emitter,
+            ),
+            event_emitter: event_emitter.clone(),
+            input_id: input_ref.id().clone(),
+        };
+        (input, sender)
+    }
+
+    /// The track ended and its EOS was delivered in a chunk. Only then it is
+    /// safe to replace the track with the next one.
+    pub(super) fn eos_sent(&self) -> bool {
+        self.event_eos_guard.emited()
+    }
+
+    pub(super) fn required(&self) -> bool {
+        self.required
+    }
+
+    pub(super) fn pause(&mut self) {
+        if !self.paused {
+            self.paused = true;
+            self.event_emitter
+                .emit(Event::AudioInputStreamPaused(self.input_id.clone()));
+        }
+    }
+
+    pub(super) fn resume(&mut self) {
+        if self.paused {
+            self.paused = false;
+            self.event_playing_guard.reset();
+        };
+    }
+
+    /// Pop all batches with PTS smaller than `pts_range.1`.
+    /// Every batch is returned exactly once (always popped, never dropped).
+    pub(super) fn pop_samples(
+        &mut self,
+        pts_range: (Timestamp, Timestamp),
+        queue_start_pts: Timestamp,
+    ) -> QueueAudioSamples {
+        if self.paused {
+            return QueueAudioSamples::empty();
+        }
+
+        let Some(offset) = self.resolve_offset(pts_range.0, queue_start_pts) else {
+            return QueueAudioSamples {
+                samples: vec![],
+                is_eos: self.check_eos(),
+            };
+        };
+
+        if let Some(offset_from_start) = self.offset_from_start
+            && pts_range.1 < queue_start_pts + offset_from_start
+        {
+            return QueueAudioSamples {
+                samples: vec![],
+                is_eos: self.check_eos(),
+            };
+        }
+
+        let input_pts = pts_range.1 + MIXER_STRETCH_BUFFER - offset;
+        trace!(queue_pts=?pts_range, ?input_pts, "Try get samples batch");
+
+        let mut samples = self.receiver.pop_before_pts(input_pts);
+        for batch in &mut samples {
+            batch.start_pts += offset;
+        }
+
+        if !samples.is_empty() {
+            self.event_playing_guard.emit();
+        }
+
+        QueueAudioSamples {
+            samples,
+            is_eos: self.check_eos(),
+        }
+    }
+
+    /// True on the first call after the track ended; also emits the EOS event.
+    fn check_eos(&mut self) -> bool {
+        let is_eos =
+            matches!(self.receiver.state(), ReceiverState::Done) && !self.event_eos_guard.emited();
+        if is_eos {
+            self.event_eos_guard.emit();
+        }
+        is_eos
+    }
+
+    pub(super) fn is_ready_for_pts(
+        &mut self,
+        pts_range: (Timestamp, Timestamp),
+        queue_start_pts: Timestamp,
+    ) -> bool {
+        if self.paused {
+            return true;
+        }
+
+        let offset = self.resolve_offset(pts_range.0, queue_start_pts);
+
+        if let Some(offset) = offset {
+            // extra buffer offsets additional latency/delay from audio mixer resampler.
+            let input_pts = pts_range.1 + MIXER_STRETCH_BUFFER - offset;
+            trace!(queue_pts=?pts_range, ?input_pts, "Is next sample batch ready for PTS");
+            return self.receiver.is_ready_for_pts(input_pts);
+        }
+
+        match self.receiver.state() {
+            ReceiverState::New => match self.offset_from_start {
+                Some(offset_from_start) => pts_range.1 < queue_start_pts + offset_from_start,
+                None => true,
+            },
+            ReceiverState::Running => {
+                warn!("receiver running, offset should already be resolved");
+                true
+            }
+            ReceiverState::Done => true,
+        }
+    }
+
+    fn resolve_offset(
+        &mut self,
+        buffer_pts: Timestamp,
+        queue_start_pts: Timestamp,
+    ) -> Option<Timestamp> {
+        if self.receiver.state() != ReceiverState::Running {
+            return self.track_offset.get();
+        }
+
+        self.event_delivered_guard.emit();
+        let offset = match self.offset_from_start {
+            Some(offset_from_start) => self
+                .track_offset
+                .get_or_init(queue_start_pts + offset_from_start),
+            None => self.track_offset.get_or_init(buffer_pts),
+        };
+        Some(offset)
+    }
+
+    /// Drops samples that won't be used for processing. This function should only be called before
+    /// queue start.
+    pub(super) fn drop_old_samples_before_start(&mut self) {
+        if self.receiver.state() == ReceiverState::New {
+            return;
+        }
+
+        self.event_delivered_guard.emit();
+        if self.offset_from_start.is_none() {
+            let now = self.queue_ctx.sync_point.timestamp_now();
+            let offset = self.track_offset.get_or_init(now);
+            let _ = self.receiver.pop_before_pts(now - offset);
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum ReceiverState {
+    New,
+    Running,
+    Done,
+}
+
+pub(crate) struct AudioInputReceiver {
+    max_size: Duration,
+    receiver: Receiver<InputAudioSamples>,
+    buffer: VecDeque<InputAudioSamples>,
+    disconnected: bool,
+    state: ReceiverState,
+    delay: Duration,
+    side_channel: Option<AudioSideChannel>,
+}
+
+impl AudioInputReceiver {
+    pub fn new(
+        delay: Duration,
+        side_channel: Option<AudioSideChannel>,
+    ) -> (Self, Sender<InputAudioSamples>) {
+        let (sender, receiver) = bounded(1);
+        let track = Self {
+            max_size: Duration::from_millis(100),
+            receiver,
+            buffer: VecDeque::new(),
+            disconnected: false,
+            state: ReceiverState::New,
+            delay,
+            side_channel,
+        };
+        (track, sender)
+    }
+
+    /// Pop all batches with `start_pts < pts`. Every batch is returned exactly once.
+    fn pop_before_pts(&mut self, pts: Timestamp) -> Vec<InputAudioSamples> {
+        if self.state == ReceiverState::Done {
+            return Vec::new();
+        }
+        self.try_enqueue_until(pts);
+
+        let mut result = Vec::new();
+        while let Some(batch) = self.buffer.front() {
+            if batch.start_pts < pts {
+                result.push(self.buffer.pop_front().unwrap());
+            } else {
+                break;
+            }
+        }
+        self.maybe_transition_to_done();
+        result
+    }
+
+    fn is_ready_for_pts(&mut self, end_pts: Timestamp) -> bool {
+        if self.state() == ReceiverState::Done || self.disconnected {
+            return true;
+        }
+        self.try_enqueue_until(end_pts);
+        match self.buffer.back() {
+            Some(batch) => batch.end_pts() >= end_pts,
+            None => matches!(self.state, ReceiverState::Done),
+        }
+    }
+
+    /// Enqueue batches from the channel, allowing exceeding `max_size`
+    /// if the buffer doesn't yet cover `needed_pts`.
+    fn try_enqueue_until(&mut self, needed_pts: Timestamp) {
+        let side_channel_size = match self.side_channel {
+            Some(_) => self.delay,
+            None => Duration::ZERO,
+        };
+        loop {
+            if self.disconnected {
+                return;
+            }
+            let back = self.buffer.back();
+            let has_needed = back
+                .map(|batch| batch.end_pts() > needed_pts)
+                .unwrap_or(false);
+            if has_needed && self.size() >= self.max_size && self.size() >= side_channel_size {
+                return;
+            }
+            match self.receiver.try_recv() {
+                Ok(mut batch) => {
+                    trace!(pts_range=?batch.pts_range(), pending=self.receiver.len(), "Enqueue samples");
+                    batch.start_pts += self.delay;
+                    if let Some(side_channel) = &self.side_channel {
+                        side_channel.send_samples(&batch);
+                    }
+                    self.buffer.push_back(batch);
+                    self.state = ReceiverState::Running;
+                }
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    debug!("Queue audio channel disconnected");
+                    self.disconnected = true;
+                    self.maybe_transition_to_done();
+                    return;
+                }
+            }
+        }
+    }
+
+    fn state(&mut self) -> ReceiverState {
+        self.try_enqueue_until(Timestamp::ZERO);
+        self.state
+    }
+
+    fn maybe_transition_to_done(&mut self) {
+        if self.disconnected && self.buffer.is_empty() {
+            self.state = ReceiverState::Done;
+            debug!("Queue audio input done")
+        }
+    }
+
+    pub fn size(&self) -> Duration {
+        match (self.buffer.front(), self.buffer.back()) {
+            (Some(front), Some(back)) => {
+                (back.end_pts() - front.start_pts).to_duration_saturating()
+            }
+            _ => Duration::ZERO,
+        }
+    }
+}

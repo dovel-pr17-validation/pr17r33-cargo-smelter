@@ -1,0 +1,212 @@
+use anyhow::Result;
+use inquire::Select;
+use integration_tests::media::VideoCodec;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::fmt::Debug;
+use strum::{Display, EnumIter, IntoEnumIterator};
+
+use crate::inputs::{
+    hls::HlsInput, moq_client::MoqClientInput, moq_server::MoqServerInput, mp4::Mp4Input,
+    rtmp::RtmpInput, rtp::RtpInput, v4l2::V4l2Input, whep::WhepInput, whip::WhipInput,
+};
+
+pub mod hls;
+pub mod moq_client;
+pub mod moq_server;
+pub mod mp4;
+pub mod rtmp;
+pub mod rtp;
+pub mod v4l2;
+pub mod whep;
+pub mod whip;
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum InputHandle {
+    Rtp(RtpInput),
+    Rtmp(RtmpInput),
+    Mp4(Mp4Input),
+    Hls(HlsInput),
+    Whip(WhipInput),
+    Whep(WhepInput),
+    MoqServer(MoqServerInput),
+    MoqClient(MoqClientInput),
+    V4l2(V4l2Input),
+}
+
+impl InputHandle {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Rtp(i) => &i.name,
+            Self::Rtmp(i) => &i.name,
+            Self::Mp4(i) => &i.name,
+            Self::Hls(i) => &i.name,
+            Self::Whip(i) => &i.name,
+            Self::Whep(i) => &i.name,
+            Self::MoqServer(i) => &i.name,
+            Self::MoqClient(i) => &i.name,
+            Self::V4l2(i) => &i.name,
+        }
+    }
+
+    pub fn serialize_register(&self) -> serde_json::Value {
+        match self {
+            Self::Rtp(i) => i.serialize_register(),
+            Self::Rtmp(i) => i.serialize_register(),
+            Self::Mp4(i) => i.serialize_register(),
+            Self::Hls(i) => i.serialize_register(),
+            Self::Whip(i) => i.serialize_register(),
+            Self::Whep(i) => i.serialize_register(),
+            Self::MoqServer(i) => i.serialize_register(),
+            Self::MoqClient(i) => i.serialize_register(),
+            Self::V4l2(i) => i.serialize_register(),
+        }
+    }
+
+    pub fn has_video(&self) -> bool {
+        match self {
+            Self::Rtp(i) => i.has_video(),
+            Self::Rtmp(i) => i.has_video(),
+            Self::Whep(i) => i.has_video(),
+            Self::Whip(i) => i.has_video(),
+            _ => true,
+        }
+    }
+
+    pub fn has_audio(&self) -> bool {
+        match self {
+            Self::Rtp(i) => i.has_audio(),
+            Self::V4l2(_) => false,
+            _ => true,
+        }
+    }
+
+    pub fn on_before_registration(&mut self) -> Result<()> {
+        match self {
+            Self::Whep(i) => i.on_before_registration(),
+            Self::MoqClient(i) => i.on_before_registration(),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn on_after_registration(&mut self) -> Result<()> {
+        match self {
+            Self::Rtp(i) => i.on_after_registration(),
+            Self::Rtmp(i) => i.on_after_registration(),
+            Self::Whip(i) => i.on_after_registration(),
+            Self::MoqServer(i) => i.on_after_registration(),
+            _ => Ok(()),
+        }
+    }
+}
+
+impl std::fmt::Display for InputHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name())
+    }
+}
+
+#[derive(Debug, EnumIter, Display, Clone, Copy)]
+pub enum InputProtocol {
+    #[strum(to_string = "rtmp_server")]
+    Rtmp,
+
+    #[strum(to_string = "whip_server")]
+    Whip,
+
+    #[strum(to_string = "whep_client")]
+    Whep,
+
+    #[strum(to_string = "mp4")]
+    Mp4,
+
+    #[strum(to_string = "hls")]
+    Hls,
+
+    #[strum(to_string = "moq_server")]
+    MoqServer,
+
+    #[strum(to_string = "moq_client")]
+    MoqClient,
+
+    #[strum(to_string = "v4l2")]
+    V4l2,
+
+    #[strum(to_string = "rtp_stream")]
+    Rtp,
+}
+
+#[derive(Debug, EnumIter, Display, PartialEq, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoDecoder {
+    #[strum(to_string = "any")]
+    Any,
+
+    #[strum(to_string = "ffmpeg_h264")]
+    FfmpegH264,
+
+    #[strum(to_string = "vulkan_h264")]
+    VulkanH264,
+
+    #[strum(to_string = "ffmpeg_vp8")]
+    FfmpegVp8,
+
+    #[strum(to_string = "ffmpeg_vp9")]
+    FfmpegVp9,
+}
+
+impl From<VideoDecoder> for VideoCodec {
+    fn from(value: VideoDecoder) -> Self {
+        match value {
+            VideoDecoder::FfmpegH264 | VideoDecoder::VulkanH264 | VideoDecoder::Any => {
+                VideoCodec::H264
+            }
+            VideoDecoder::FfmpegVp8 => VideoCodec::Vp8,
+            VideoDecoder::FfmpegVp9 => VideoCodec::Vp9,
+        }
+    }
+}
+
+#[derive(Debug, Display, EnumIter, Serialize, Deserialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioDecoder {
+    #[strum(to_string = "opus")]
+    Opus,
+}
+
+#[derive(Debug, Display, EnumIter, Default, PartialEq, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputBufferOption {
+    #[default]
+    #[strum(to_string = "default")]
+    Default,
+
+    #[strum(to_string = "min 200ms, desired 500ms")]
+    Low,
+
+    #[strum(to_string = "desired 5s")]
+    High,
+}
+
+impl InputBufferOption {
+    pub fn prompt() -> Result<Self> {
+        let options = InputBufferOption::iter().collect();
+        let selection =
+            Select::new("Select buffer (ESC for default):", options).prompt_skippable()?;
+        Ok(selection.unwrap_or_default())
+    }
+
+    /// Value of the `buffer` field in the register request.
+    pub fn serialize_register(&self) -> serde_json::Value {
+        match self {
+            Self::Default => serde_json::Value::Null,
+            Self::Low => json!({ "min_ms": 200, "desired_ms": 500 }),
+            Self::High => json!(5000),
+        }
+    }
+}
+
+pub fn filter_video_inputs(inputs: &[InputHandle]) -> Vec<&InputHandle> {
+    inputs.iter().filter(|i| i.has_video()).collect()
+}

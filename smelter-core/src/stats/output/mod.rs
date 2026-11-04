@@ -1,0 +1,126 @@
+use crate::{
+    MediaKind, OutputProtocolKind,
+    stats::{
+        output::hls::HlsOutputState, output::moq_client::MoqClientOutputState,
+        output::mp4::Mp4OutputState, output::rtmp::RtmpOutputState, output::rtp::RtpOutputState,
+        output::whep::WhepOutputState, output::whip::WhipOutputState,
+        output_reports::OutputStatsReport,
+    },
+};
+
+use tracing::error;
+
+pub(super) mod hls;
+pub(super) mod moq_client;
+pub(super) mod mp4;
+pub(super) mod rtmp;
+pub(super) mod rtp;
+pub(super) mod whep;
+pub(super) mod whip;
+
+pub(crate) use hls::{HlsOutputStatsEvent, HlsOutputTrackStatsEvent};
+pub(crate) use moq_client::{MoqClientOutputStatsEvent, MoqClientOutputTrackStatsEvent};
+pub(crate) use mp4::{Mp4OutputStatsEvent, Mp4OutputTrackStatsEvent};
+pub(crate) use rtmp::{RtmpOutputStatsEvent, RtmpOutputTrackStatsEvent};
+pub(crate) use rtp::{RtpOutputStatsEvent, RtpOutputTrackStatsEvent};
+pub(crate) use whep::{WhepOutputStatsEvent, WhepOutputTrackStatsEvent};
+pub(crate) use whip::{WhipOutputStatsEvent, WhipOutputTrackStatsEvent};
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum StatsTrackKind {
+    Video,
+    Audio,
+}
+
+impl From<MediaKind> for StatsTrackKind {
+    fn from(value: MediaKind) -> Self {
+        match value {
+            MediaKind::Video(_) => Self::Video,
+            MediaKind::Audio(_) => Self::Audio,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum OutputStatsEvent {
+    Whep(WhepOutputStatsEvent),
+    Whip(WhipOutputStatsEvent),
+    Hls(HlsOutputStatsEvent),
+    Mp4(Mp4OutputStatsEvent),
+    Rtmp(RtmpOutputStatsEvent),
+    Rtp(RtpOutputStatsEvent),
+    MoqClient(MoqClientOutputStatsEvent),
+}
+
+#[derive(Debug)]
+pub enum OutputStatsState {
+    Whep(WhepOutputState),
+    Whip(WhipOutputState),
+    Hls(HlsOutputState),
+    Mp4(Mp4OutputState),
+    Rtmp(RtmpOutputState),
+    Rtp(RtpOutputState),
+    MoqClient(MoqClientOutputState),
+}
+
+impl OutputStatsState {
+    /// `None` for outputs without stats.
+    pub fn new(kind: OutputProtocolKind) -> Option<Self> {
+        let state = match kind {
+            OutputProtocolKind::Whep => OutputStatsState::Whep(WhepOutputState::new()),
+            OutputProtocolKind::Whip => OutputStatsState::Whip(WhipOutputState::new()),
+            OutputProtocolKind::Hls => OutputStatsState::Hls(HlsOutputState::new()),
+            OutputProtocolKind::Mp4 => OutputStatsState::Mp4(Mp4OutputState::new()),
+            OutputProtocolKind::Rtp => OutputStatsState::Rtp(RtpOutputState::new()),
+            OutputProtocolKind::Rtmp => OutputStatsState::Rtmp(RtmpOutputState::new()),
+            OutputProtocolKind::MoqClient => {
+                OutputStatsState::MoqClient(MoqClientOutputState::new())
+            }
+            OutputProtocolKind::RawDataChannel | OutputProtocolKind::EncodedDataChannel => {
+                return None;
+            }
+        };
+        Some(state)
+    }
+
+    pub fn report(&mut self) -> OutputStatsReport {
+        match self {
+            Self::Whep(state) => OutputStatsReport::Whep(state.report()),
+            Self::Whip(state) => OutputStatsReport::Whip(state.report()),
+            Self::Hls(state) => OutputStatsReport::Hls(state.report()),
+            Self::Mp4(state) => OutputStatsReport::Mp4(state.report()),
+            Self::Rtmp(state) => OutputStatsReport::Rtmp(state.report()),
+            Self::Rtp(state) => OutputStatsReport::Rtp(state.report()),
+            Self::MoqClient(state) => OutputStatsReport::MoqClient(state.report()),
+        }
+    }
+
+    pub fn handle_event(&mut self, event: OutputStatsEvent) {
+        match (self, event) {
+            (OutputStatsState::Whep(state), OutputStatsEvent::Whep(event)) => {
+                state.handle_event(event)
+            }
+            (OutputStatsState::Whip(state), OutputStatsEvent::Whip(event)) => {
+                state.handle_event(event)
+            }
+            (OutputStatsState::Hls(state), OutputStatsEvent::Hls(event)) => {
+                state.handle_event(event)
+            }
+            (OutputStatsState::Mp4(state), OutputStatsEvent::Mp4(event)) => {
+                state.handle_event(event)
+            }
+            (OutputStatsState::Rtmp(state), OutputStatsEvent::Rtmp(event)) => {
+                state.handle_event(event)
+            }
+            (OutputStatsState::Rtp(state), OutputStatsEvent::Rtp(event)) => {
+                state.handle_event(event)
+            }
+            (OutputStatsState::MoqClient(state), OutputStatsEvent::MoqClient(event)) => {
+                state.handle_event(event)
+            }
+            (state, event) => {
+                error!(?state, ?event, "Wrong event type for output.")
+            }
+        }
+    }
+}

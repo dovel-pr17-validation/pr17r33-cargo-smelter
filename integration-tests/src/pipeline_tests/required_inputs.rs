@@ -1,0 +1,687 @@
+use std::{thread, time::Duration};
+
+use anyhow::Result;
+use integration_tests_macros::pipeline_test;
+use serde_json::json;
+
+use crate::{
+    CommunicationProtocol, CompositorInstance, input_dump_from_disk,
+    pipeline_tests::{
+        PipelineTest,
+        harness::{
+            AudioCompareConfig, FftCompareConfig, OutputReceiver, PacketSender, VideoCompareConfig,
+            compare_audio_dumps, compare_video_dumps,
+            fft::{ArtificialTolerance, Mode},
+        },
+    },
+    split_rtp_packet_dump,
+};
+
+fn artificial_fft(
+    tolerance: Option<ArtificialTolerance>,
+    allowed_failed_batches: u32,
+) -> FftCompareConfig {
+    let mut cfg = FftCompareConfig::artificial(vec![Duration::ZERO..Duration::from_secs(10)]);
+    if let Some(t) = tolerance {
+        cfg.mode = Mode::Artificial(t);
+    }
+    cfg.allowed_failed_batches = allowed_failed_batches;
+    cfg
+}
+
+#[allow(dead_code)]
+pub const TESTS: &[PipelineTest] = &[
+    REQUIRED_VIDEO_INPUTS_NO_OFFSET,
+    REQUIRED_VIDEO_INPUTS_WITH_OFFSET,
+    REQUIRED_AUDIO_INPUTS_NO_OFFSET,
+    REQUIRED_AUDIO_INPUTS_WITH_OFFSET,
+    REQUIRED_AUDIO_INPUTS_WITH_OFFSET_MISSING_DATA,
+    OPTIONAL_INPUTS_NO_OFFSET_FLAKY,
+];
+
+#[pipeline_test(
+    description = "
+        Required inputs with some packets delayed.
+        No offset (it might require adding the _flaky suffix)
+
+        Show `input_1` and `input_2` side by side for 20 seconds.
+    ",
+    snapshot_name = "required_video_inputs_no_offset_output.rtp"
+)]
+pub fn required_video_inputs_no_offset() -> Result<()> {
+    let instance = CompositorInstance::start(None);
+    let input_1_port = instance.get_port();
+    let input_2_port = instance.get_port();
+    let output_port = instance.get_port();
+
+    instance.send_request(
+        "output/output_1/register",
+        json!({
+            "type": "rtp_stream",
+            "transport_protocol": "tcp_server",
+            "port": output_port,
+            "video": {
+                "resolution": {
+                    "width": 640,
+                    "height": 360,
+                },
+                "encoder": {
+                    "type": "ffmpeg_h264",
+                    "ffmpeg_options": { "preset": "ultrafast" },
+                },
+                "initial": {
+                    "root": {
+                        "type": "tiles",
+                        "padding": 3,
+                        "background_color": "#DDDDDDFF",
+                        "children": [
+                            {
+                                "type": "input_stream",
+                                "input_id": "input_1",
+                            },
+                            {
+                                "type": "input_stream",
+                                "input_id": "input_2",
+                            },
+                        ],
+                    }
+                }
+            },
+        }),
+    )?;
+
+    instance.send_request(
+        "output/output_1/unregister",
+        json!({
+            "schedule_time_ms": 20000,
+        }),
+    )?;
+
+    let output_receiver = OutputReceiver::start(output_port, CommunicationProtocol::Tcp)?;
+
+    instance.send_request(
+        "input/input_1/register",
+        json!({
+            "type": "rtp_stream",
+            "transport_protocol": "tcp_server",
+            "port": input_1_port,
+            "video": {
+                "decoder": "ffmpeg_h264"
+            },
+            "required": true,
+        }),
+    )?;
+
+    instance.send_request(
+        "input/input_2/register",
+        json!({
+            "type": "rtp_stream",
+            "transport_protocol": "tcp_server",
+            "port": input_2_port,
+            "video": {
+                "decoder": "ffmpeg_h264"
+            },
+            "required": true,
+        }),
+    )?;
+
+    let input_1_sender = PacketSender::new(CommunicationProtocol::Tcp, input_1_port)?;
+    let mut input_2_sender = PacketSender::new(CommunicationProtocol::Tcp, input_2_port)?;
+    let input_1_dump = input_dump_from_disk("8_colors_input_video.rtp")?;
+    let input_2_dump = input_dump_from_disk("8_colors_input_reversed_video.rtp")?;
+    let (input_2_first_part, input_2_second_part) =
+        split_rtp_packet_dump(input_2_dump, Duration::from_secs(1))?;
+
+    let input_1_handle = input_1_sender.send_non_blocking(input_1_dump);
+
+    let input_2_handle = thread::spawn(move || {
+        input_2_sender.send(&input_2_first_part).unwrap();
+        // Simulate delay in sending input_2 packets.
+        thread::sleep(Duration::from_secs(3));
+        input_2_sender.send(&input_2_second_part).unwrap();
+    });
+
+    instance.send_request("start", json!({}))?;
+
+    input_1_handle.join().unwrap();
+    input_2_handle.join().unwrap();
+    let new_output_dump = output_receiver.wait_for_output()?;
+
+    compare_video_dumps(
+        OUTPUT_DUMP_FILE,
+        &new_output_dump,
+        VideoCompareConfig {
+            validation_intervals: vec![Duration::ZERO..Duration::from_secs(18)],
+            max_failed_pairs: 10,
+            ..Default::default()
+        },
+    )?;
+
+    Ok(())
+}
+
+#[pipeline_test(
+    description = "
+        Required inputs with some packets delayed. Offset set to 0.
+
+        Show `input_1` and `input_2` side by side for 20 seconds.
+    ",
+    snapshot_name = "required_video_inputs_with_offset_output.rtp"
+)]
+pub fn required_video_inputs_with_offset() -> Result<()> {
+    let instance = CompositorInstance::start(None);
+    let input_1_port = instance.get_port();
+    let input_2_port = instance.get_port();
+    let output_port = instance.get_port();
+
+    instance.send_request(
+        "output/output_1/register",
+        json!({
+            "type": "rtp_stream",
+            "transport_protocol": "tcp_server",
+            "port": output_port,
+            "video": {
+                "resolution": {
+                    "width": 640,
+                    "height": 360,
+                },
+                "encoder": {
+                    "type": "ffmpeg_h264",
+                    "ffmpeg_options": { "preset": "ultrafast" },
+                },
+                "initial": {
+                    "root": {
+                        "type": "tiles",
+                        "padding": 3,
+                        "background_color": "#DDDDDDFF",
+                        "children": [
+                            {
+                                "type": "input_stream",
+                                "input_id": "input_1",
+                            },
+                            {
+                                "type": "input_stream",
+                                "input_id": "input_2",
+                            },
+                        ],
+                    }
+                }
+            },
+        }),
+    )?;
+
+    instance.send_request(
+        "output/output_1/unregister",
+        json!({
+            "schedule_time_ms": 20000,
+        }),
+    )?;
+
+    let output_receiver = OutputReceiver::start(output_port, CommunicationProtocol::Tcp)?;
+
+    instance.send_request(
+        "input/input_1/register",
+        json!({
+            "type": "rtp_stream",
+            "transport_protocol": "tcp_server",
+            "port": input_1_port,
+            "video": {
+                "decoder": "ffmpeg_h264"
+            },
+            "required": true,
+            "offset_ms": 0,
+        }),
+    )?;
+
+    instance.send_request(
+        "input/input_2/register",
+        json!({
+            "type": "rtp_stream",
+            "transport_protocol": "tcp_server",
+            "port": input_2_port,
+            "video": {
+                "decoder": "ffmpeg_h264"
+            },
+            "required": true,
+            "offset_ms": 0,
+        }),
+    )?;
+
+    let input_1_sender = PacketSender::new(CommunicationProtocol::Tcp, input_1_port)?;
+    let mut input_2_sender = PacketSender::new(CommunicationProtocol::Tcp, input_2_port)?;
+    let input_1_dump = input_dump_from_disk("8_colors_input_video.rtp")?;
+    let input_2_dump = input_dump_from_disk("8_colors_input_reversed_video.rtp")?;
+    let (input_2_first_part, input_2_second_part) =
+        split_rtp_packet_dump(input_2_dump, Duration::from_secs(1))?;
+
+    let input_1_handle = input_1_sender.send_non_blocking(input_1_dump);
+
+    let input_2_handle = thread::spawn(move || {
+        input_2_sender.send(&input_2_first_part).unwrap();
+        // Simulate delay in sending input_2 packets.
+        thread::sleep(Duration::from_secs(3));
+        input_2_sender.send(&input_2_second_part).unwrap();
+    });
+
+    instance.send_request("start", json!({}))?;
+
+    input_1_handle.join().unwrap();
+    input_2_handle.join().unwrap();
+    let new_output_dump = output_receiver.wait_for_output()?;
+
+    compare_video_dumps(
+        OUTPUT_DUMP_FILE,
+        &new_output_dump,
+        VideoCompareConfig {
+            validation_intervals: vec![Duration::ZERO..Duration::from_secs(18)],
+            max_failed_pairs: 1,
+            ..Default::default()
+        },
+    )?;
+
+    Ok(())
+}
+
+#[pipeline_test(
+    description = "
+        Required audio input with some packets delayed in the middle (1s sent,
+        3s pause, then the rest). No offset.
+
+        Continuous 440 Hz tone for 10 seconds.
+    ",
+    snapshot_name = "required_audio_inputs_no_offset_output.rtp"
+)]
+pub fn required_audio_inputs_no_offset() -> Result<()> {
+    let instance = CompositorInstance::start(None);
+    let input_1_port = instance.get_port();
+    let output_port = instance.get_port();
+
+    instance.send_request(
+        "output/output_1/register",
+        json!({
+            "type": "rtp_stream",
+            "transport_protocol": "tcp_server",
+            "port": output_port,
+            "audio": {
+                "initial": {
+                    "inputs": [
+                        {
+                            "input_id": "input_1",
+                        },
+                    ]
+                },
+                "channels": "stereo",
+                "encoder": {
+                    "type": "opus",
+                }
+            },
+        }),
+    )?;
+
+    instance.send_request(
+        "output/output_1/unregister",
+        json!({
+            "schedule_time_ms": 10000,
+        }),
+    )?;
+
+    let output_receiver = OutputReceiver::start(output_port, CommunicationProtocol::Tcp)?;
+
+    instance.send_request(
+        "input/input_1/register",
+        json!({
+            "type": "rtp_stream",
+            "transport_protocol": "tcp_server",
+            "port": input_1_port,
+            "audio": {
+                "decoder": "opus"
+            },
+            "required": true,
+        }),
+    )?;
+
+    let mut input_sender = PacketSender::new(CommunicationProtocol::Tcp, input_1_port)?;
+    let input_dump = input_dump_from_disk("a_opus_audio.rtp")?;
+    let (input_first_part, input_second_part) =
+        split_rtp_packet_dump(input_dump, Duration::from_secs(1))?;
+
+    let input_handle = thread::spawn(move || {
+        input_sender.send(&input_first_part).unwrap();
+        thread::sleep(Duration::from_secs(3));
+        input_sender.send(&input_second_part).unwrap();
+    });
+
+    instance.send_request("start", json!({}))?;
+
+    input_handle.join().unwrap();
+    let new_output_dump = output_receiver.wait_for_output()?;
+
+    // Because no offset is set and http request take nondeterministic time starting frames may
+    // fail as they arrive at slightly different timestamps for each test.
+    compare_audio_dumps(
+        OUTPUT_DUMP_FILE,
+        &new_output_dump,
+        AudioCompareConfig {
+            fft: Some(artificial_fft(None, 2)),
+            ..Default::default()
+        },
+    )?;
+
+    Ok(())
+}
+
+#[pipeline_test(
+    description = "
+        Required audio input with some packets delayed in the middle (1s sent,
+        3s pause, then the rest). Offset set to 1000ms.
+
+        1 second of silence, then a continuous 440 Hz tone for the remaining 9 seconds.
+    ",
+    snapshot_name = "required_audio_inputs_with_offset_output.rtp"
+)]
+pub fn required_audio_inputs_with_offset() -> Result<()> {
+    let instance = CompositorInstance::start(None);
+    let input_1_port = instance.get_port();
+    let output_port = instance.get_port();
+
+    instance.send_request(
+        "output/output_1/register",
+        json!({
+            "type": "rtp_stream",
+            "transport_protocol": "tcp_server",
+            "port": output_port,
+            "audio": {
+                "initial": {
+                    "inputs": [
+                        {
+                            "input_id": "input_1",
+                            "volume": 1.0,
+                        },
+                    ]
+                },
+                "channels": "stereo",
+                "encoder": {
+                    "type": "opus",
+                }
+            },
+        }),
+    )?;
+
+    instance.send_request(
+        "output/output_1/unregister",
+        json!({
+            "schedule_time_ms": 10000,
+        }),
+    )?;
+
+    let output_receiver = OutputReceiver::start(output_port, CommunicationProtocol::Tcp)?;
+
+    instance.send_request(
+        "input/input_1/register",
+        json!({
+            "type": "rtp_stream",
+            "transport_protocol": "tcp_server",
+            "port": input_1_port,
+            "audio": {
+                "decoder": "opus"
+            },
+            "offset_ms": 1000,
+            "required": true,
+        }),
+    )?;
+
+    let mut input_sender = PacketSender::new(CommunicationProtocol::Tcp, input_1_port)?;
+    let input_dump = input_dump_from_disk("a_opus_audio.rtp")?;
+    let (input_first_part, input_second_part) =
+        split_rtp_packet_dump(input_dump, Duration::from_secs(1))?;
+
+    let input_handle = thread::spawn(move || {
+        input_sender.send(&input_first_part).unwrap();
+        thread::sleep(Duration::from_secs(3));
+        input_sender.send(&input_second_part).unwrap();
+    });
+
+    instance.send_request("start", json!({}))?;
+
+    input_handle.join().unwrap();
+    let new_output_dump = output_receiver.wait_for_output()?;
+
+    // This test is a bit flaky when it comes to frequency level fluctuations so less strict
+    // tolerance is set.
+    compare_audio_dumps(
+        OUTPUT_DUMP_FILE,
+        &new_output_dump,
+        AudioCompareConfig {
+            fft: Some(artificial_fft(
+                Some(ArtificialTolerance {
+                    frequency_level: 100.0,
+                }),
+                0,
+            )),
+            ..Default::default()
+        },
+    )?;
+
+    Ok(())
+}
+
+#[pipeline_test(
+    description = "
+        Required inputs with some packets delayed and some dropped. Offset set to 1000ms.
+
+        - 1 second of silence
+        - 1 second of audio (from the start of the recording)
+        - 2 seconds of silence
+        - remaining part of audio (2 seconds from previous step are missing)
+    ",
+    snapshot_name = "required_audio_inputs_with_offset_missing_data_output.rtp"
+)]
+pub fn required_audio_inputs_with_offset_missing_data() -> Result<()> {
+    let instance = CompositorInstance::start(None);
+    let input_1_port = instance.get_port();
+    let output_port = instance.get_port();
+
+    instance.send_request(
+        "output/output_1/register",
+        json!({
+            "type": "rtp_stream",
+            "transport_protocol": "tcp_server",
+            "port": output_port,
+            "audio": {
+                "initial": {
+                    "inputs": [
+                        {
+                            "input_id": "input_1",
+                            "volume": 1.0,
+                        },
+                    ]
+                },
+                "channels": "stereo",
+                "encoder": {
+                    "type": "opus",
+                }
+            },
+        }),
+    )?;
+
+    instance.send_request(
+        "output/output_1/unregister",
+        json!({
+            "schedule_time_ms": 10000,
+        }),
+    )?;
+
+    let output_receiver = OutputReceiver::start(output_port, CommunicationProtocol::Tcp)?;
+
+    instance.send_request(
+        "input/input_1/register",
+        json!({
+            "type": "rtp_stream",
+            "transport_protocol": "tcp_server",
+            "port": input_1_port,
+            "audio": {
+                "decoder": "opus"
+            },
+            "offset_ms": 1000,
+            "required": true,
+        }),
+    )?;
+
+    let mut input_sender = PacketSender::new(CommunicationProtocol::Tcp, input_1_port)?;
+    let input_dump = input_dump_from_disk("a_opus_audio.rtp")?;
+    let (input_first_part, input_second_part) =
+        split_rtp_packet_dump(input_dump, Duration::from_secs(1))?;
+    let (_dropped_2_seconds, input_second_part_2) =
+        split_rtp_packet_dump(input_second_part, Duration::from_secs(2))?;
+
+    let input_handle = thread::spawn(move || {
+        input_sender.send(&input_first_part).unwrap();
+        thread::sleep(Duration::from_secs(3));
+        input_sender.send(&input_second_part_2).unwrap();
+    });
+
+    instance.send_request("start", json!({}))?;
+
+    input_handle.join().unwrap();
+    let new_output_dump = output_receiver.wait_for_output()?;
+
+    // This test is a bit flaky when it comes to frequency level fluctuations so less strict
+    // tolerance is set.
+    compare_audio_dumps(
+        OUTPUT_DUMP_FILE,
+        &new_output_dump,
+        AudioCompareConfig {
+            fft: Some(artificial_fft(
+                Some(ArtificialTolerance {
+                    frequency_level: 100.0,
+                }),
+                0,
+            )),
+            ..Default::default()
+        },
+    )?;
+
+    Ok(())
+}
+
+#[pipeline_test(
+    description = "
+        Optional inputs with some packets delayed in the middle.
+        No offset.
+
+        Show `input_1` and `input_2` side by side for 1 second. `input_2` stops sending
+        frames for 5 seconds and then returns back to showing both streams. On replay
+        the gap should last for approx. 3 seconds as the renderer resorts to
+        a blank fallback stream if there are no new frames received for 2 seconds.
+    ",
+    snapshot_name = "optional_inputs_no_offset_output.rtp"
+)]
+pub fn optional_inputs_no_offset_flaky() -> Result<()> {
+    let instance = CompositorInstance::start(None);
+    let input_1_port = instance.get_port();
+    let input_2_port = instance.get_port();
+    let output_port = instance.get_port();
+
+    instance.send_request(
+        "output/output_1/register",
+        json!({
+            "type": "rtp_stream",
+            "transport_protocol": "tcp_server",
+            "port": output_port,
+            "video": {
+                "resolution": {
+                    "width": 640,
+                    "height": 360,
+                },
+                "encoder": {
+                    "type": "ffmpeg_h264",
+                    "ffmpeg_options": { "preset": "ultrafast" },
+                },
+                "initial": {
+                    "root": {
+                        "type": "tiles",
+                        "padding": 3,
+                        "background_color": "#DDDDDDFF",
+                        "children": [
+                            {
+                                "type": "input_stream",
+                                "input_id": "input_1",
+                            },
+                            {
+                                "type": "input_stream",
+                                "input_id": "input_2",
+                            },
+                        ],
+                    }
+                }
+            },
+        }),
+    )?;
+
+    instance.send_request(
+        "output/output_1/unregister",
+        json!({
+            "schedule_time_ms": 20000,
+        }),
+    )?;
+
+    let output_receiver = OutputReceiver::start(output_port, CommunicationProtocol::Tcp)?;
+
+    instance.send_request(
+        "input/input_1/register",
+        json!({
+            "type": "rtp_stream",
+            "transport_protocol": "tcp_server",
+            "port": input_1_port,
+            "video": {
+                "decoder": "ffmpeg_h264"
+            },
+        }),
+    )?;
+
+    instance.send_request(
+        "input/input_2/register",
+        json!({
+            "type": "rtp_stream",
+            "transport_protocol": "tcp_server",
+            "port": input_2_port,
+            "video": {
+                "decoder": "ffmpeg_h264"
+            },
+        }),
+    )?;
+
+    let input_1_sender = PacketSender::new(CommunicationProtocol::Tcp, input_1_port)?;
+    let mut input_2_sender = PacketSender::new(CommunicationProtocol::Tcp, input_2_port)?;
+    let input_1_dump = input_dump_from_disk("8_colors_input_video.rtp")?;
+    let input_2_dump = input_dump_from_disk("8_colors_input_reversed_video.rtp")?;
+    let (input_2_first_part, input_2_second_part) =
+        split_rtp_packet_dump(input_2_dump, Duration::from_secs(1))?;
+
+    let input_1_handle = input_1_sender.send_non_blocking(input_1_dump);
+
+    let input_2_handle = thread::spawn(move || {
+        input_2_sender.send(&input_2_first_part).unwrap();
+        // Simulate delay in sending input_2 packets.
+        thread::sleep(Duration::from_secs(5));
+        input_2_sender.send(&input_2_second_part).unwrap();
+    });
+
+    instance.send_request("start", json!({}))?;
+
+    input_1_handle.join().unwrap();
+    input_2_handle.join().unwrap();
+    let new_output_dump = output_receiver.wait_for_output()?;
+
+    compare_video_dumps(
+        OUTPUT_DUMP_FILE,
+        &new_output_dump,
+        VideoCompareConfig {
+            validation_intervals: vec![Duration::ZERO..Duration::from_secs(18)],
+            max_failed_pairs: 15,
+            ..Default::default()
+        },
+    )?;
+
+    Ok(())
+}
